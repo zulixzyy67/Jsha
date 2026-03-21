@@ -1,0 +1,53 @@
+# ╔══════════════════════════════════════════════════════╗
+# ║  Bot v51 — Requirements                              ║
+# ║  Run: pip install -r requirements.txt                ║
+# ╚══════════════════════════════════════════════════════╝
+
+# ── Core bot framework ────────────────────────────────────
+python-telegram-bot>=20.8
+httpx>=0.27.0            # PTB's internal HTTP client
+
+# ── Async networking (replaces requests + ThreadPoolExecutor) ──
+aiohttp>=3.9.5
+aiofiles>=23.2.1
+
+# ── Async database (replaces sqlite3 + run_in_executor) ───────
+aiosqlite>=0.20.0
+
+# ── Distributed state (replaces in-memory ThreadSafeDict) ─────
+redis>=5.0.4             # redis.asyncio included; set REDIS_URL env var
+                         # If Redis unavailable, bot falls back to local-only mode
+
+# ── HTML / JS parsing ─────────────────────────────────────────
+beautifulsoup4>=4.12.3
+lxml>=5.2.1              # faster BS4 parser
+
+# ── JS AST parsing (Tier 2 — optional but recommended) ────────
+# esprima>=4.0.1         # pip install esprima
+#                        # If absent, falls back to bounded-regex (Tier 3)
+
+# ── Browser automation (persistent pool) ──────────────────────
+playwright>=1.44.0       # After install: playwright install chromium
+
+# ── Monitoring ────────────────────────────────────────────────
+psutil>=5.9.8            # Memory monitoring (optional)
+
+# ── Config ────────────────────────────────────────────────────
+python-dotenv>=1.0.1     # .env support
+
+# ── Dev / testing ─────────────────────────────────────────────
+pytest>=8.2.0
+pytest-asyncio>=0.23.6
+
+# ── Environment variables (set in Railway / .env) ─────────────
+# BOT_TOKEN=<your telegram bot token>
+# ADMIN_IDS=<comma-separated Telegram user IDs>
+# REDIS_URL=redis://localhost:6379/0        # optional; enables distributed mode
+# BROWSER_POOL_SIZE=2                       # Playwright browser instances
+# BROWSER_RENDER_TIMEOUT_MS=30000
+# MAX_JS_BYTES=4194304                      # 4 MB JS bundle cap
+# JS_MATCH_LIMIT=500                        # regex match cap per pattern
+# JS_PATTERN_TIMEOUT=2.0                    # seconds per regex pattern
+# DATA_DIR=/app/data
+# DAILY_LIMIT=10
+# DAILY_PENTEST_LIMIT=5
