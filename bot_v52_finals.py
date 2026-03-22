@@ -7122,7 +7122,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.effective_message.reply_text("🔬 Tech stack fingerprinting...")
 
-    def _do_tech_scan():
+    async def _do_tech_scan():
         # ── Reuse cached SiteProfile if available (no double request) ──
         domain_key = urlparse(url).netloc
         profile    = _PROFILE_CACHE.get(domain_key)
@@ -7134,6 +7134,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _tech_bytes  = await _tr.read()
                 resp_text    = _tech_bytes.decode('utf-8', errors='replace')
                 resp_headers = dict(_tr.headers)
+                resp_status  = _tr.status
         body         = resp_text[:80000]
         headers_str  = "\n".join(f"{k}: {v}" for k, v in resp_headers.items()).lower()
         combined     = (body + headers_str).lower()
@@ -7168,13 +7169,13 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _PROFILE_CACHE[domain_key] = p2
 
         notable = {
-            k: v for k, v in resp.headers.items()
+            k: v for k, v in resp_headers.items()
             if k.lower() in _NOTABLE_HEADERS
         }
-        return detected, notable, resp.status_code, profile
+        return detected, notable, resp_status, profile
 
     try:
-        detected, notable, status, profile = await asyncio.to_thread(_do_tech_scan)
+        detected, notable, status, profile = await _do_tech_scan()
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
         return
