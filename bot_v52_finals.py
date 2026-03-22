@@ -2389,10 +2389,14 @@ def _fetch_page_sync(url: str, use_js: bool = False) -> tuple:
             resp = _do_fetch(verify=True, referer=origin if attempt > 0 else None)
 
             # Cloudflare challenge (503/403 + cf-ray header)
-            if resp.status_code in (403, 503) and 'cf-ray' in resp.headers:
+            if resp.status_code in (403, 503) and ('cf-ray' in resp.headers or 'cloudflare' in resp.headers.get('server','').lower()):
                 if attempt < MAX_FETCH_RETRIES - 1:
                     wait = min(2 ** attempt + random.uniform(0.5, 1.5), 15)
                     logger.debug("CF challenge on %s — wait %.1fs (attempt %d)", sanitize_log_url(url), wait, attempt)
+                    # Rotate CF bypass strategy each retry
+                    bypass_hdrs = _get_cf_bypass_headers(attempt)
+                    hdrs = {**bypass_hdrs, 'Referer': url}
+                    referer = url
                     time.sleep(wait)
                     continue
                 return None, False
@@ -2483,8 +2487,22 @@ def fetch_page(url: str, use_js: bool = False) -> tuple:
     """Returns: (html | None, js_used: bool)
     Bug fix: requests.get() ကို sync ဖြင့် run — event loop ကို မ block ဖို့
     async context ထဲမှာ asyncio.to_thread(fetch_page, url) ဖြင့် ခေါ်ပါ
+    CF bypass: empty result ဖြစ်ရင် bypass strategies ဖြင့် retry
     """
-    return _fetch_page_sync(url, use_js)
+    html, js_used = _fetch_page_sync(url, use_js)
+    if not html:
+        # Retry with CF/WAF bypass header rotation
+        for attempt in range(len(_CF_BYPASS_SESSIONS)):
+            try:
+                import time as _t
+                _t.sleep(0.8 + attempt * 0.5)
+                sess = _make_cf_session(attempt)
+                r = sess.get(url, timeout=20, verify=False, allow_redirects=True)
+                if r.status_code == 200 and len(r.text) > 100:
+                    return r.text, False
+            except Exception:
+                continue
+    return html, js_used
 
 
 # ══════════════════════════════════════════════════
@@ -2950,7 +2968,7 @@ def fetch_sitemap(base_url: str) -> set:
 
     # 1. Check HTML for <link rel="sitemap">
     try:
-        r = requests.get(base_url, headers=_get_headers(), timeout=10, verify=False)
+        r = _make_cf_session(0).get(base_url, timeout=10, verify=False)
         if r.status_code == 200:
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(r.text, 'html.parser')
@@ -2963,7 +2981,7 @@ def fetch_sitemap(base_url: str) -> set:
 
     # 2. Check robots.txt for sitemap pointer
     try:
-        r = requests.get(f"{root}/robots.txt", headers=_get_headers(),
+        r = _make_cf_session(0).get(f"{root}/robots.txt",
                          timeout=8, verify=False)
         if r.status_code == 200:
             for m in _RE_ROBOTS_SM.finditer(r.text):
@@ -4909,8 +4927,84 @@ def _get_headers(referer: str = None, bypass_403: bool = False) -> dict:
 
     if referer:
         hdrs['Referer'] = referer
+
+    # ── Cloudflare bypass extras (rotate to appear as real browser) ──
+    # CF checks: TLS fingerprint, cookie presence, header order, timing
+    # These headers help pass CF's JS challenge heuristics passively
+    cf_extras = random.choice([
+        {
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cache-Control':   'no-cache',
+            'Pragma':          'no-cache',
+        },
+        {
+            'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
+            'Cache-Control':   'max-age=0',
+        },
+        {
+            'Accept-Language': 'en-US,en;q=0.8,zh-CN;q=0.5',
+            'Cache-Control':   'no-store, must-revalidate',
+        },
+    ])
+    hdrs.update(cf_extras)
+    # Randomize header value details to avoid fingerprinting
+    if random.random() < 0.3:
+        hdrs['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
     return hdrs
 
+
+
+
+# ── Cloudflare bypass strategies (used by scan commands) ──────────────────
+_CF_BYPASS_SESSIONS = [
+    # Strategy 1: Fresh Chrome with realistic timing
+    lambda: {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+             'Accept-Language': 'en-US,en;q=0.9', 'Accept-Encoding': 'gzip, deflate, br',
+             'Sec-CH-UA': '"Chromium";v="122","Google Chrome";v="122","Not(A:Brand";v="24"',
+             'Sec-CH-UA-Mobile': '?0', 'Sec-CH-UA-Platform': '"Windows"',
+             'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate',
+             'Sec-Fetch-Site': 'none', 'Sec-Fetch-User': '?1',
+             'Cache-Control': 'max-age=0', 'Upgrade-Insecure-Requests': '1'},
+    # Strategy 2: Safari macOS
+    lambda: {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+             'Accept-Language': 'en-GB,en;q=0.9', 'Accept-Encoding': 'gzip, deflate, br',
+             'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate',
+             'Sec-Fetch-Site': 'none', 'Upgrade-Insecure-Requests': '1'},
+    # Strategy 3: Firefox with distinct headers
+    lambda: {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
+             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+             'Accept-Language': 'en-US,en;q=0.5', 'Accept-Encoding': 'gzip, deflate, br',
+             'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate',
+             'Sec-Fetch-Site': 'none', 'Sec-Fetch-User': '?1',
+             'Upgrade-Insecure-Requests': '1', 'TE': 'trailers'},
+    # Strategy 4: Mobile Chrome
+    lambda: {'User-Agent': 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36',
+             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+             'Accept-Language': 'en-US,en;q=0.9', 'Accept-Encoding': 'gzip, deflate, br',
+             'Sec-CH-UA': '"Chromium";v="122","Google Chrome";v="122","Not(A:Brand";v="24"',
+             'Sec-CH-UA-Mobile': '?1', 'Sec-CH-UA-Platform': '"Android"',
+             'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate',
+             'Upgrade-Insecure-Requests': '1'},
+]
+
+def _get_cf_bypass_headers(attempt: int = 0) -> dict:
+    """Get CF bypass headers - rotates strategy per attempt."""
+    strategy = _CF_BYPASS_SESSIONS[attempt % len(_CF_BYPASS_SESSIONS)]
+    return strategy()
+
+def _make_cf_session(attempt: int = 0) -> requests.Session:
+    """Create a requests.Session pre-configured for CF bypass."""
+    sess = requests.Session()
+    hdrs = _get_cf_bypass_headers(attempt)
+    sess.headers.update(hdrs)
+    # Mount retry adapter
+    adapter = HTTPAdapter(max_retries=Retry(total=2, backoff_factor=0.5,
+                          status_forcelist=[429, 500, 502, 503, 524]))
+    sess.mount('https://', adapter)
+    sess.mount('http://', adapter)
+    return sess
 
 # ══════════════════════════════════════════════════
 # 🔍  SITE PROFILE DETECTOR  — Adaptive download
@@ -5309,7 +5403,7 @@ def _verify_subdomain_real(sub_url: str) -> bool:
 
     # Check if it returns anything
     try:
-        r = requests.get(sub_url, headers=_get_headers(), timeout=5,
+        r = _make_cf_session(0).get(sub_url, timeout=5,
                          allow_redirects=True, verify=False, stream=True)
         r.close()
         code = r.status_code
@@ -5816,7 +5910,7 @@ async def _security_guard(update, context, heavy: bool = True):
 async def _scan_guard(update, context, cmd_type: str, cmd_label: str) -> bool:
     """
     Standard guard for all heavy scan commands.
-    Checks: force_join → rate_limit → quota → active_scan → user_slot
+    Checks: force_join → rate_limit → quota → active_scan → global_semaphore
     Returns True if ALL checks pass (caller can proceed).
     Usage:
         if not await _scan_guard(update, context, 'scan', 'Vuln Scan'): return
@@ -5832,16 +5926,24 @@ async def _scan_guard(update, context, cmd_type: str, cmd_label: str) -> bool:
         return False
 
     # Daily quota
-    ok, remaining, msg = quota_check(uid, cmd_type)
+    ok, remaining, msg_txt = quota_check(uid, cmd_type)
     if not ok:
-        await update.effective_message.reply_text(msg, parse_mode='Markdown')
+        await update.effective_message.reply_text(msg_txt, parse_mode='Markdown')
         return False
 
-    # Active scan check
+    # Active scan check (per-user)
     if uid in _active_scans:
         await update.effective_message.reply_text(
             f"⏳ `{_active_scans.get(uid)}` running\n"
             f"ပြီးဆုံးဖို့ စောင့်ပါ သို့မဟုတ် `/stop` နှိပ်ပါ",
+            parse_mode='Markdown')
+        return False
+
+    # Global concurrency check (prevent Railway OOM under heavy load)
+    if scan_semaphore._value == 0:
+        await update.effective_message.reply_text(
+            f"⚙️ *System busy* — `{scan_semaphore._value}` scans running globally\n"
+            f"1-2 မိနစ်ကြာပြီးနောက် ပြန်ကြိုးစားပါ",
             parse_mode='Markdown')
         return False
 
@@ -8090,6 +8192,7 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     _active_scans.set(uid, "403 Bypass")
     asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "Bypass403", url if context.args else "")))
+    uid = update.effective_user.id
     allowed, wait = check_rate_limit(uid)
     if not allowed:
         await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
@@ -8699,6 +8802,7 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "Subdomains", url if context.args else "")))
     # Skip rate limit if called internally from /discover
     if not context.user_data.get('_discover_internal'):
+        uid = update.effective_user.id
         allowed, wait = check_rate_limit(uid)
         if not allowed:
             await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
@@ -8749,7 +8853,8 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        data = await asyncio.to_thread(_subdomains_sync, raw, progress_q)
+        async with scan_semaphore:
+            data = await asyncio.to_thread(_subdomains_sync, raw, progress_q)
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
@@ -9052,6 +9157,10 @@ _FUZZ_PATHS = [
     "go.sum","go.mod","Cargo.toml",
 ]
 
+
+# Alias for api_fuzzer command
+_FUZZER_PATHS = _FUZZ_PATHS
+
 _FUZZ_PARAMS = [
     # ── Common / IDOR ──────────────────────────────
     "id","uid","user_id","userid","account_id","order_id","product_id",
@@ -9224,6 +9333,46 @@ def _fuzz_sync(base: str, mode: str, progress_q: list) -> tuple:
 
     found.sort(key=lambda x: (x["status"] != 200, x["status"]))
     return found, baseline_status
+
+
+
+async def cmd_fuzz_unified(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /fuzz <url> [mode]
+    Unified fuzzer:
+      /fuzz <url>          — path fuzzing (583 paths, async aiohttp)
+      /fuzz <url> paths    — same as above
+      /fuzz <url> params   — parameter fuzzing
+      /fuzz <url> smart    — context-aware smart fuzzing
+      /fuzz <url> dirs     — directory brute force
+    """
+    if not await check_force_join(update, context): return
+    args = context.args or []
+    if not args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:*\n"
+            f"  `/fuzz <url>`        — Path fuzzing (`{len(_FUZZ_PATHS)}` paths, fast async)\n"
+            "  `/fuzz <url> params` — Parameter fuzzing\n"
+            "  `/fuzz <url> dirs`   — Dir brute-force (aiohttp parallel)\n"
+            "  `/fuzz <url> smart`  — Context-aware smart fuzzing\n\n"
+            "⚠️ _Authorized testing only._",
+            parse_mode='Markdown')
+        return
+    mode = args[-1].lower() if len(args) > 1 else "paths"
+    if mode in ("params", "paths", "smart", "dirs"):
+        context.args = args[:-1] if len(args) > 1 else args
+    else:
+        mode = "paths"
+    if mode == "dirs":
+        await cmd_dir_brute(update, context)
+    elif mode == "smart":
+        await cmd_smartfuzz(update, context)
+    elif mode == "params":
+        context.args = list(context.args) + ["params"]
+        await cmd_fuzz(update, context)
+    else:
+        # default: paths — use dir_brute's fast async engine
+        await cmd_dir_brute(update, context)
 
 
 async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10414,7 +10563,7 @@ def _build_context_wordlist(url: str, progress_cb=None) -> tuple:
 
     # ── Scrape homepage + up to 3 internal pages ──
     try:
-        r = requests.get(url, headers=_get_headers(), timeout=12, verify=False)
+        r = _make_cf_session(0).get(url, timeout=12, verify=False)
         soup = BeautifulSoup(r.text, 'html.parser')
         if progress_cb:
             progress_cb("🌐 Homepage scraped")
@@ -11217,6 +11366,7 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Rate limit ───────────────────────────────
+    uid = update.effective_user.id
     allowed, wait = check_rate_limit(uid)
     if not allowed:
         await update.message.reply_text(f"⏱️ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
@@ -11661,229 +11811,142 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show main help menu with category buttons"""
-    uid = update.effective_user.id
-    is_adm = uid in ADMIN_IDS
-    kb_rows = [
-        [
-            InlineKeyboardButton("📥 Download",      callback_data="help_dl"),
-            InlineKeyboardButton("🔍 Scanner",        callback_data="help_scan"),
-        ],
-        [
-            InlineKeyboardButton("🕵️ Recon",          callback_data="help_recon"),
-            InlineKeyboardButton("🔎 Discover",        callback_data="help_discover"),
-        ],
-        [
-            InlineKeyboardButton("🔔 Monitor",        callback_data="help_monitor"),
-            InlineKeyboardButton("📊 Account",         callback_data="help_account"),
-        ],
-        [
-            InlineKeyboardButton("🆕 V20 Security",   callback_data="help_v20"),
-            InlineKeyboardButton("📱 App Analyzer",    callback_data="help_app"),
-        ],
-        [
-            InlineKeyboardButton("🛠️ Tools",           callback_data="help_tools"),
-        ],
-    ]
-    if is_adm:
-        kb_rows.append([InlineKeyboardButton("👑 Admin Panel", callback_data="help_admin")])
-    await update.effective_message.reply_text(
-        "📖 *Help — Category ရွေးပါ*",
-        reply_markup=InlineKeyboardMarkup(kb_rows),
-        parse_mode='Markdown'
+    """/help — Show command list with categories"""
+    if not await check_force_join(update, context): return
+    args = context.args or []
+    
+    # Category-based help
+    categories = {
+        "recon":    ("🔍 Reconnaissance", [
+            ("/info <domain>",       "WHOIS + DNS + RDAP"),
+            ("/info <domain> sub",   "Subdomain enumeration"),
+            ("/info <domain> whois", "WHOIS only"),
+            ("/info <domain> dns",   "DNS records only"),
+            ("/recon <url>",         "Full recon (headers+tech+cookies+links)"),
+            ("/waf <url>",           "WAF fingerprint + Cloudflare bypass"),
+            ("/shodan_lite <domain>","Passive OSINT recon"),
+            ("/site_map <url>",      "Sitemap crawler"),
+            ("/screenshot <url>",    "Website screenshot"),
+        ]),
+        "scan":     ("🔬 Vulnerability Scanning", [
+            ("/scan <url>",          "Quick multi-check scan"),
+            ("/pentest <url>",       "Full pentest (SQLi+XSS+SSRF+LFI+Auth)"),
+            ("/scan_single sqli <url>","SQL injection only"),
+            ("/scan_single xss <url>", "XSS only"),
+            ("/scan_single ssrf <url>","SSRF + open redirect"),
+            ("/scan_single lfi <url>", "LFI path traversal"),
+            ("/scan_single auth <url>","Auth weaknesses"),
+        ]),
+        "api":      ("🔌 API & Discovery", [
+            ("/api <url>",           "Admin panel finder"),
+            ("/api <url> discover",  "API endpoint discovery"),
+            ("/api <url> fuzz",      "API fuzzer with 403 bypass"),
+            ("/api <url> test",      "API token extractor"),
+            ("/api <url> all",       "Full API recon (all modes)"),
+            ("/discover <url>",      "Deep API + JS endpoint discovery"),
+        ]),
+        "audit":    ("🛡️ Security Audit & Fixes", [
+            ("/audit <url>",         "Full security audit (recommended)"),
+            ("/audit <url> owasp",   "OWASP security report"),
+            ("/audit <url> report",  "Export full pentest report"),
+            ("/audit history",       "View your scan history"),
+            ("/fix <url>",           "Prioritized fix roadmap"),
+            ("/fix <url> guide",     "Detailed fix guide"),
+            ("/fix <url> hardening", "Server hardening checklist"),
+            ("/fix <url> nginx",     "Nginx hardening guide"),
+        ]),
+        "ssl":      ("🔒 SSL / CORS / WAF", [
+            ("/ssl <domain>",        "SSL certificate check"),
+            ("/ssl <domain> deep",   "Deep TLS/cipher audit"),
+            ("/cors <url>",          "CORS misconfiguration check"),
+            ("/cors <url> deep",     "Deep CORS audit"),
+            ("/waf <url>",           "WAF detect + Cloudflare origin IP"),
+            ("/ratelimit_test <url>","Rate limiting test"),
+            ("/xxe <url>",           "XXE injection test"),
+        ]),
+        "tools":    ("🛠️ Tools & Utilities", [
+            ("/dl <url>",            "Download website source"),
+            ("/analyze <domain>",    "Analyze downloaded JS source"),
+            ("/fuzz <url>",          "Directory/path fuzzing"),
+            ("/secretscan <url>",    "Scan for leaked secrets"),
+            ("/sourcemap <url>",     "Source map leak detection"),
+            ("/gitexposed <url>",    "Exposed .git detection"),
+            ("/jwtattack <token>",   "JWT attack tests"),
+            ("/bruteforce <url>",    "Login brute force"),
+            ("/paramfuzz <url>",     "Parameter fuzzing"),
+            ("/smuggle <url>",       "HTTP request smuggling"),
+            ("/nuclei_lite <url>",   "CVE template scanner"),
+            ("/codeaudit <domain>",  "Backend code audit"),
+        ]),
+        "other":    ("📦 Other", [
+            ("/monitor add <url>",   "Page change monitor"),
+            ("/appassets",           "Upload APK/IPA for analysis"),
+            ("/proxy",               "Proxy management"),
+            ("/scan_history",        "View scan history"),
+            ("/mystats",             "Your usage stats"),
+            ("/stop",                "Stop current operation"),
+        ]),
+    }
+    
+    if args and args[0].lower() in categories:
+        cat = args[0].lower()
+        title, cmds = categories[cat]
+        lines = [f"{title}\n{'━'*22}\n"]
+        for cmd, desc in cmds:
+            lines.append(f"  `{cmd}` — {desc}")
+        lines.append(f"\n_Use /help for all categories_")
+        await update.effective_message.reply_text(
+            "\n".join(lines), parse_mode='Markdown')
+        return
+    
+    # Main help menu
+    cat_list = "\n".join(
+        f"  `/help {k}` — {v[0]}" for k, v in categories.items()
     )
+    msg = (
+        "🤖 *PhantomScope Bot — Command Guide*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*📂 Categories:*\n"
+        f"{cat_list}\n\n"
+        "*⚡ Quick Start:*\n"
+        "  `/pentest https://example.com` — Full scan\n"
+        "  `/audit https://example.com` — Security audit\n"
+        "  `/api https://example.com all` — API recon\n"
+        "  `/info example.com` — WHOIS + DNS\n\n"
+        "*🔥 Power Commands:*\n"
+        "  `/api <url> all` — Admin + API + Fuzz + Test\n"
+        "  `/audit <url>` — devaudit + OWASP + report\n"
+        "  `/ssl <url> deep` — Full TLS audit\n"
+        "  `/cors <url> deep` — Full CORS audit\n"
+        "  `/info <domain> sub` — Subdomains\n\n"
+        "📊 *Total: 62 commands → 8 unified groups*\n"
+        "⚠️ _Authorized testing only_"
+    )
+    kb = [[
+        InlineKeyboardButton("🔍 Recon",   callback_data="help_recon"),
+        InlineKeyboardButton("🔬 Scan",    callback_data="help_scan"),
+        InlineKeyboardButton("🔌 API",     callback_data="help_api"),
+    ],[
+        InlineKeyboardButton("🛡️ Audit",   callback_data="help_audit"),
+        InlineKeyboardButton("🔒 SSL/WAF", callback_data="help_ssl"),
+        InlineKeyboardButton("🛠️ Tools",   callback_data="help_tools"),
+    ],[
+        InlineKeyboardButton("📦 Other",   callback_data="help_other"),
+    ]]
+    await update.effective_message.reply_text(
+        msg, parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(kb))
 
-
-# ──────────────────────────────────────────────────
-# Help category callback handler
-# ──────────────────────────────────────────────────
-
-_HELP_PAGES = {
-    "help_dl": (
-        "📥 *Download*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "`/dl <url>`\n"
-        "  └ Mode ရွေးဖို့ keyboard ပေါ်လာမယ်\n\n"
-        "`/dl <url> full`   — Full site crawl\n"
-        "`/dl <url> js`     — JS/React/Vue render\n"
-        "`/dl <url> jsful`  — JS + Full site\n\n"
-        "`/resume <url>`  — ကျသွားလျှင် ဆက်\n"
-        "`/stop`          — Download ရပ်ရန်\n\n"
-        "💡 50MB+ → auto split & send"
-    ),
-    "help_scan": (
-        "🔍 *Security Scanner*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "`/scan <url>`\n\n"
-        "URL တစ်ခုထည့်ရုံနဲ့ modules အကုန်အလိုအလျောက် run မည်:\n"
-        "  🛡️ Vulnerability scan\n"
-        "  🌀 Path & param fuzzer\n"
-        "  🧠 Smart context-aware fuzzer\n"
-        "  🔓 403 bypass tester\n\n"
-        "💡 Mode ရွေးစရာမလို — အကုန် auto-run"
-    ),
-    "help_recon": (
-        "🕵️ *Recon*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "`/recon <url>`\n\n"
-        "URL တစ်ခုထည့်ရုံနဲ့ modules အကုန်အလိုအလျောက် run မည်:\n"
-        "  🔬 Tech stack\n"
-        "  📌 HTTP security headers\n"
-        "  🌍 WHOIS / IP info\n"
-        "  🍪 Cookie security flags\n"
-        "  🤖 robots.txt\n"
-        "  🔗 Page links\n\n"
-        "💡 Mode ရွေးစရာမလို — အကုန် auto-run"
-    ),
-    "help_discover": (
-        "🔎 *Discovery*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "`/discover <url>`\n\n"
-        "URL တစ်ခုထည့်ရုံနဲ့ modules အကုန်အလိုအလျောက် run မည်:\n"
-        "  🔌 API endpoint discovery\n"
-        "  🔑 Secret / API key scanner\n"
-        "  📡 Subdomain enumeration\n\n"
-        "🆕 *New (v41):*\n"
-        "`/api <url>` — Admin Panel Finder\n"
-        "  └ ရှာဖွေမည့်နေရာပေါင်း ၅၀၀ ကျော်\n"
-        "  └ Login pages, Dashboards, DB admin စသည်\n\n"
-        "💡 Mode ရွေးစရာမလို — အကုန် auto-run | Secrets: AWS, JWT, Stripe, GitHub tokens စစ်"
-    ),
-    "help_monitor": (
-        "🔔 *Page Monitor*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "`/monitor add <url> [min] [label]`\n"
-        "  └ Page ပြောင်းရင် alert ပို့မည်\n"
-        "  └ interval = minutes (default 30)\n\n"
-        "`/monitor list`   — ကြည့်ရန်\n"
-        "`/monitor del <n>`— ဖျက်ရန်\n"
-        "`/monitor clear`  — အားလုံးဖျက်\n\n"
-        "💡 Max 10 monitors"
-    ),
-    "help_account": (
-        "📊 *My Account*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "`/status`   — Daily limit + usage bar\n"
-        "`/history`  — Download log (last 10)\n"
-        "`/mystats`  — Total downloads + stats\n"
-        "`/stop`     — Download ရပ်ရန်"
-    ),
-    "help_app": (
-        "📱 *App Analyzer*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Chat ထဲ file drop ရုံသာ — auto analyze\n\n"
-        "Supported: APK / IPA / ZIP / JAR / AAB\n\n"
-        "Extracts:\n"
-        "  • API endpoints & domains\n"
-        "  • Hardcoded secrets & keys\n"
-        "  • AndroidManifest / Info.plist\n"
-        "  • Permission risk analysis\n"
-        "  • DEX string extraction\n\n"
-        "`/appassets` — Asset extractor"
-    ),
-    "help_v20": (
-        "🆕 *V20 — Advanced Security Tools*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "☁️ *CDN / Real IP*\n"
-        "`/cloudcheck example.com`\n"
-        "  └ MX records + subdomains + passive DNS\n"
-        "  └ Cloudflare real IP bypass\n\n"
-        "🔬 *Parameter Discovery*\n"
-        "`/paramfuzz <url> [get|post]`\n"
-        "  └ 300+ params | Arjun-style batch testing\n\n"
-        "📂 *Sensitive Files*\n`/sensitive <url>`\n  └ Brute-force 30+ sensitive paths (.env, .git, etc.)\n\n🔌 *BOLA/IDOR*\n`/bola <url>`\n  └ Test API endpoints for IDOR vulnerabilities\n\n🤖 *Auto Pentest*\n"
-        "`/autopwn <url>`\n"
-        "  └ 7 phases: Tech→Fuzz→Secrets→Params→Report\n"
-        "  └ JSON report auto-export\n\n"
-        "📋 *Bulk Scan*\n"
-        "`/bulkscan` + .txt file upload\n"
-        "  └ Max 50 URLs | vuln scan"
-    ),
-    "help_tools": (
-        "🛠️ *Standalone Tools*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "`/screenshot <url>` — Page screenshot (Puppeteer)\n"
-        "`/antibot <url>`    — CF/captcha bypass\n"
-        "`/jwtattack <token>`— JWT decode & crack\n\n"
-        "🔄 *Proxy Download (v35 NEW)*\n"
-        "`/proxy_download <url>`  — Auto-fetch proxy & download\n"
-        "  └ Automatically fetches & validates working proxies\n"
-        "  └ Rotates through proxy chain\n"
-        "  └ Fallback to direct if proxies unavailable\n\n"
-        "`/proxy_status`  — Check proxy pool health"
-    ),
-    "help_admin": (
-        "👑 *Admin Commands*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "`/admin`                  — Admin panel\n"
-        "`/sys`                    — Storage status\n"
-        "`/sys clean`              — Cleanup files\n"
-        "`/sys logs [n]`           — View logs\n\n"
-        "`/adminset limit <n>`     — Daily limit (0=∞)\n"
-        "`/adminset pages <n>`     — Max crawl pages\n"
-        "`/adminset assets <n>`    — Max assets\n\n"
-        "`/ban <id>` `/unban <id>`\n"
-        "`/userinfo <id>`\n"
-        "`/broadcast <msg>`\n"
-        "`/allusers`\n"
-        "`/setforcejoin`"
-    ),
-}
-
-_BACK_KB = InlineKeyboardMarkup([[
-    InlineKeyboardButton("◀️ Back", callback_data="help_back")
-]])
 
 async def help_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle help category button presses"""
+    """Handle /help category button presses"""
     query = update.callback_query
     await query.answer()
-    data  = query.data
-    uid   = query.from_user.id
+    cat = query.data.replace("help_", "")
+    # Delegate to /help with category arg
+    context.args = [cat]
+    await cmd_help(update, context)
 
-    if data == "help_back":
-        is_adm = uid in ADMIN_IDS
-        kb_rows = [
-            [
-                InlineKeyboardButton("📥 Download",   callback_data="help_dl"),
-                InlineKeyboardButton("🔍 Scanner",    callback_data="help_scan"),
-            ],
-            [
-                InlineKeyboardButton("🕵️ Recon",      callback_data="help_recon"),
-                InlineKeyboardButton("🔎 Discover",   callback_data="help_discover"),
-            ],
-            [
-                InlineKeyboardButton("🔔 Monitor",    callback_data="help_monitor"),
-                InlineKeyboardButton("📊 Account",    callback_data="help_account"),
-            ],
-            [
-                InlineKeyboardButton("🆕 V20 Security", callback_data="help_v20"),
-                InlineKeyboardButton("📱 App Analyzer",  callback_data="help_app"),
-            ],
-            [
-                InlineKeyboardButton("🛠️ Tools",        callback_data="help_tools"),
-            ],
-        ]
-        if is_adm:
-            kb_rows.append([InlineKeyboardButton("👑 Admin Panel", callback_data="help_admin")])
-        await query.edit_message_text(
-            "📖 *Help — Category ရွေးပါ*",
-            reply_markup=InlineKeyboardMarkup(kb_rows),
-            parse_mode='Markdown'
-        )
-        return
-
-    page = _HELP_PAGES.get(data)
-    if page:
-        # Admin-only check
-        if data == "help_admin" and uid not in ADMIN_IDS:
-            await query.answer("🚫 Admin only", show_alert=True)
-            return
-        await query.edit_message_text(
-            page,
-            reply_markup=_BACK_KB,
-            parse_mode='Markdown'
-        )
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with db_lock:
@@ -13968,7 +14031,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _do_tech_scan_sync(url: str) -> dict:
     """Sync tech detection — returns {detected: {cat: [items]}, headers: {}}"""
     try:
-        r = requests.get(url, headers=_get_headers(), timeout=15,
+        r = _make_cf_session(0).get(url, timeout=15,
                          verify=False, allow_redirects=True, stream=True)
         buf = io.BytesIO()
         # v46: Increased buffer for deeper tech analysis
@@ -14001,7 +14064,7 @@ def _do_tech_scan_sync(url: str) -> dict:
 def _do_headers_scan_sync(url: str) -> dict:
     """Sync HTTP headers fetch."""
     try:
-        r = requests.get(url, headers=_get_headers(), timeout=12,
+        r = _make_cf_session(0).get(url, timeout=12,
                          verify=False, allow_redirects=True)
         hdrs = dict(r.headers)
         hdrs_l = {k.lower(): v for k, v in hdrs.items()}
@@ -14052,7 +14115,7 @@ def _do_whois_scan_sync(domain: str) -> dict:
 def _do_cookies_scan_sync(url: str) -> dict:
     """Sync cookie fetch and parse."""
     try:
-        r = requests.get(url, headers=_get_headers(), timeout=12,
+        r = _make_cf_session(0).get(url, timeout=12,
                          verify=False, allow_redirects=True)
         cookies = []
         for ck in r.cookies:
@@ -14091,7 +14154,7 @@ def _do_robots_scan_sync(url: str) -> dict:
     parsed_url = urlparse(url)
     robots_url = f"{parsed_url.scheme}://{parsed_url.netloc}/robots.txt"
     try:
-        r = requests.get(robots_url, headers=_get_headers(), timeout=8, verify=False)
+        r = _make_cf_session(0).get(robots_url, timeout=8, verify=False)
         if r.status_code != 200:
             return {"disallow": [], "sitemaps": [], "status": r.status_code}
         disallows, sitemaps, allows = [], [], []
@@ -14114,7 +14177,7 @@ def _do_robots_scan_sync(url: str) -> dict:
 def _do_links_scan_sync(url: str) -> dict:
     """Sync page link extraction."""
     try:
-        r = requests.get(url, headers=_get_headers(), timeout=12,
+        r = _make_cf_session(0).get(url, timeout=12,
                          verify=False, allow_redirects=True)
         # v46: Increased buffer for deeper link analysis
         soup = BeautifulSoup(r.text[:500000], _BS_PARSER)
@@ -14580,7 +14643,7 @@ def _do_sqli_scan_sync(url: str) -> dict:
     out = {"total_found": 0, "vulnerable": False, "db_type": None,
            "param": None, "poc": None, "type": None, "evidence": ""}
     try:
-        sess  = _make_session(10)
+        sess  = _make_cf_session(0)  # CF bypass
         r     = sess.get(url, timeout=10, allow_redirects=True, verify=False)
         forms = _parse_forms(r.text, r.url)
         params= _get_url_params(r.url)
@@ -14597,7 +14660,7 @@ def _do_xss_scan_sync(url: str) -> dict:
     out = {"total_found": 0, "vulnerable": False,
            "param": None, "poc": None, "dom_sinks": [], "evidence": ""}
     try:
-        sess  = _make_session(10)
+        sess  = _make_cf_session(0)  # CF bypass
         r     = sess.get(url, timeout=10, allow_redirects=True, verify=False)
         forms = _parse_forms(r.text, r.url)
         params= _get_url_params(r.url)
@@ -15271,9 +15334,18 @@ def _analyze_source_sync(domain: str) -> dict:
 
 async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/analyze <domain>  — Scan downloaded source code for secrets/routes/XSS/SQLi/CVEs"""
-    if not await check_force_join(update, context):
-        return
+    if not await check_force_join(update, context): return
     uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid, heavy=True)
+    if not allowed:
+        await update.effective_message.reply_text(
+            f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    if uid in _active_scans:
+        await update.effective_message.reply_text(
+            f"⏳ `{_active_scans.get(uid)}` running — `/stop`",
+            parse_mode='Markdown')
+        return
 
     if not context.args:
         await update.effective_message.reply_text(
@@ -15330,7 +15402,8 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        result = await asyncio.to_thread(_analyze_source_sync, domain)
+        async with scan_semaphore:
+            result = await asyncio.to_thread(_analyze_source_sync, domain)
     except Exception as e:
         _active_scans.pop(uid, None)
         await msg.edit_text(
@@ -15645,6 +15718,13 @@ async def cmd_apitest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
     uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid, heavy=True)
+    if not allowed:
+        await update.effective_message.reply_text(
+            f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+        return
+    uid = update.effective_user.id
 
     if not context.args:
         await update.effective_message.reply_text(
@@ -15705,7 +15785,8 @@ async def cmd_apitest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_apitest_sync, url, progress_q)
+        async with scan_semaphore:
+            result = await asyncio.to_thread(_apitest_sync, url, progress_q)
     except Exception as e:
         await msg.edit_text(
             f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`",
@@ -16228,6 +16309,18 @@ async def cmd_codeaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/codeaudit <domain>  — Deep backend code audit (PHP/Python/config) after /dl"""
     if not await check_force_join(update, context):
         return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid, heavy=True)
+    if not allowed:
+        await update.effective_message.reply_text(
+            f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    if uid in _active_scans:
+        await update.effective_message.reply_text(
+            f"⏳ `{_active_scans.get(uid)}` running — `/stop`",
+            parse_mode='Markdown')
+        return
+        return
 
     if not context.args:
         await update.effective_message.reply_text(
@@ -16288,7 +16381,8 @@ async def cmd_codeaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        result = await asyncio.to_thread(_codeaudit_sync, domain)
+        async with scan_semaphore:
+            result = await asyncio.to_thread(_codeaudit_sync, domain)
     except Exception as e:
         _active_scans.pop(uid, None)
         await msg.edit_text(
@@ -16432,14 +16526,20 @@ import html as _html
 _scan_req_counter: dict = {}   # {thread_id: count}
 _scan_req_lock = threading.Lock()
 
-def _make_session(timeout: int = 10) -> requests.Session:
-    """Create a hardened requests session with Railway-optimized settings."""
+def _make_session(timeout: int = 10, cf_bypass: bool = False,
+                   attempt: int = 0) -> requests.Session:
+    """Create a hardened requests session.
+    cf_bypass=True: rotate CF bypass header strategies to evade WAF.
+    """
     s = requests.Session()
-    s.headers.update(_get_headers())
+    if cf_bypass:
+        s.headers.update(_get_cf_bypass_headers(attempt))
+    else:
+        s.headers.update(_get_headers())
     s.verify = False
-    s.max_redirects = 3
+    s.max_redirects = 5
     adapter = requests.adapters.HTTPAdapter(
-        max_retries=0,   # no retry inside scan engines — let caller handle
+        max_retries=0,
         pool_connections=4,
         pool_maxsize=8,
     )
@@ -16619,12 +16719,23 @@ def _sqli_engine_sync(url: str, forms: list, params: dict, progress_cb=None) -> 
     }
     tid  = threading.get_ident()
     with _scan_req_lock: _scan_req_counter[tid] = 0
-    sess = _make_session(10)
-
-    # WAF detection: baseline 403/406/429 → avoid false positives
+    # CF/WAF bypass: try multiple strategies
     waf_detected = False
+    sess = None
+    for _cf_attempt in range(4):
+        try:
+            _s = _make_session(10, cf_bypass=(_cf_attempt > 0), attempt=_cf_attempt)
+            base_r = _s.get(url, timeout=10, verify=False, allow_redirects=True)
+            if base_r.status_code not in (403, 406, 429, 503):
+                sess = _s
+                break
+            import time as _time; _time.sleep(0.5 + _cf_attempt * 0.3)
+        except Exception:
+            continue
+    if sess is None:
+        sess = _make_cf_session(3)  # last resort: full CF session
     try:
-        base_r = sess.get(url, timeout=8, verify=False)
+        base_r = sess.get(url, timeout=10, verify=False)
         if base_r.status_code in (403, 406, 429, 503):
             waf_detected = True
             result["waf_blocked"] = True
@@ -16837,7 +16948,7 @@ def _xss_engine_sync(url: str, forms: list, params: dict, progress_cb=None) -> d
     }
     tid  = threading.get_ident()
     with _scan_req_lock: _scan_req_counter[tid] = 0
-    sess = _make_session(8)
+    sess = _make_cf_session(0)   # CF bypass
 
     # Check CSP first
     try:
@@ -17007,7 +17118,7 @@ def _ssrf_engine_sync(url: str, params: dict, forms: list, progress_cb=None) -> 
     }
     tid  = threading.get_ident()
     with _scan_req_lock: _scan_req_counter[tid] = 0
-    sess = _make_session(8)
+    sess = _make_cf_session(0)   # CF bypass
     parsed = urlparse(url)
     root = f"{parsed.scheme}://{parsed.netloc}"
 
@@ -17160,7 +17271,7 @@ def _lfi_engine_sync(url: str, params: dict, progress_cb=None) -> dict:
     }
     tid  = threading.get_ident()
     with _scan_req_lock: _scan_req_counter[tid] = 0
-    sess = _make_session(8)
+    sess = _make_cf_session(0)  # CF bypass
 
     # Collect LFI-likely params
     all_p = list(params.keys())
@@ -17263,7 +17374,9 @@ def _auth_engine_sync(url: str, forms: list, progress_cb=None) -> dict:
         "poc_cred":        None,
         "fix":             [],
     }
-    sess = _make_session(8)
+    # Use CF bypass session to handle WAF-protected login pages
+    sess = _make_cf_session(0)
+    sess.verify = False
 
     # Find login form
     login_form = None
@@ -17480,14 +17593,22 @@ def _format_pentest_report(domain: str, sqli: dict, xss: dict, ssrf: dict,
 
 
 async def _prescan(url: str) -> tuple:
-    """Returns (html, forms, params) — reused by all engines."""
+    """Returns (html, forms, params) — reused by all engines.
+    Tries CF bypass strategies if initial request returns 403/503.
+    """
     def _fetch():
-        try:
-            sess = _make_session(12)
-            r    = sess.get(url, timeout=12, allow_redirects=True)
-            return r.text, r.url
-        except Exception:
-            return "", url
+        # Try up to 4 CF bypass strategies
+        for attempt in range(4):
+            try:
+                sess = _make_session(12, cf_bypass=(attempt > 0), attempt=attempt)
+                r = sess.get(url, timeout=12, allow_redirects=True)
+                if r.status_code not in (403, 503, 429) or attempt == 3:
+                    return r.text, r.url
+                import time as _t; _t.sleep(0.4 * (attempt + 1))
+            except Exception:
+                if attempt == 3:
+                    return "", url
+        return "", url
 
     html, final_url = await asyncio.to_thread(_fetch)
     forms  = _parse_forms(html, final_url)
@@ -17503,6 +17624,11 @@ async def cmd_pentest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/pentest <url> — Full offensive pentest: SQLi + XSS + SSRF + LFI + Auth"""
     if not await check_force_join(update, context): return
     uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid, heavy=True)
+    if not allowed:
+        await update.effective_message.reply_text(
+            f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
     # Pentest-specific rate limit (stricter than normal heavy)
     ok, reason = check_pentest_rate(uid)
     if not ok:
@@ -17620,7 +17746,7 @@ async def cmd_pentest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Format and send
         parts = _format_pentest_report(domain, sqli, xss, ssrf, lfi, auth)
-        await msg.edit_text(parts[0], parse_mode='Markdown')
+        await safe_edit(msg, parts[0], parse_mode='Markdown')
         for part in parts[1:]:
             if part.strip():
                 await update.effective_message.reply_text(part, parse_mode='Markdown')
@@ -18312,8 +18438,19 @@ def _devaudit_sync(url: str, progress_cb=None) -> dict:
 
     # ── 1. Headers ────────────────────────────────────────────────────────
     try:
-        resp = requests.get(url, headers=_get_headers(), timeout=15,
-                            verify=False, allow_redirects=True)
+        # Try CF bypass session first for WAF-protected sites
+        _sess = _make_cf_session(0)
+        try:
+            resp = _sess.get(url, timeout=15, verify=False, allow_redirects=True)
+            if resp.status_code in (403, 503, 429):
+                # Retry with different bypass strategy
+                _sess2 = _make_cf_session(1)
+                resp2 = _sess2.get(url, timeout=15, verify=False, allow_redirects=True)
+                if resp2.status_code < resp.status_code or resp2.status_code == 200:
+                    resp = resp2
+        except Exception:
+            resp = requests.get(url, headers=_get_headers(), timeout=15,
+                                verify=False, allow_redirects=True)
         hdrs = {k.lower(): v for k, v in resp.headers.items()}
         raw_data["status"] = resp.status_code
         raw_data["server"] = hdrs.get("server", "hidden")
@@ -18481,7 +18618,7 @@ def _devaudit_sync(url: str, progress_cb=None) -> dict:
     # ── 5. Basic SQLi probe (error-based only, safe) ───────────────────────
     try:
         test_url = url.rstrip("/") + "/?id=1'"
-        r = requests.get(test_url, headers=_get_headers(),
+        r = _make_cf_session(0).get(test_url,
                          timeout=8, verify=False, allow_redirects=True)
         sqli_errors = [
             "sql syntax", "mysql_fetch", "ORA-", "pg_query",
@@ -18616,7 +18753,7 @@ def _format_devaudit_report(result: dict) -> list:
         card += [
             "",
             f"*🔬 Test with:* `{vuln.get('test_cmd', '/devaudit <url>')}`",
-            f"*📖 Reference:* {vuln.get('refs','')[:60]}",
+            f"*📖 Reference:* `{vuln.get('refs','')[:60]}`",
             f"",
             f"_Finding {i} of {len(findings)}_",
         ]
@@ -18730,6 +18867,44 @@ def _format_devaudit_report(result: dict) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 # ⚡  /devaudit <url> — Full Developer Security Audit
 # ─────────────────────────────────────────────────────────────────────────────
+
+async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /audit <url> [mode]
+    Unified security audit command:
+      /audit <url>         — Full devaudit (headers, SSL, CORS, files, SQLi probe)
+      /audit <url> report  — OWASP security report
+      /audit <url> fix     — Priority fix roadmap
+      /audit <url> hard    — Server hardening guide
+    """
+    if not await check_force_join(update, context): return
+    uid = update.effective_user.id
+    args = context.args or []
+    if not args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:*\n"
+            "  `/audit <url>`        — Full security audit\n"
+            "  `/audit <url> report` — OWASP report\n"
+            "  `/audit <url> fix`    — Fix roadmap\n"
+            "  `/audit <url> hard`   — Hardening guide\n\n"
+            "💡 `devaudit`, `secreport`, `fixall`, `hardening` ↑ ဒါတွေအားလုံး",
+            parse_mode='Markdown')
+        return
+    mode = args[-1].lower() if len(args) > 1 else "full"
+    if mode in ("report", "fix", "hard"):
+        context.args = args[:-1]
+    else:
+        mode = "full"
+    if mode == "report":
+        await cmd_secreport(update, context)
+    elif mode == "fix":
+        await cmd_fixall(update, context)
+    elif mode == "hard":
+        await cmd_hardening(update, context)
+    else:
+        await cmd_devaudit(update, context)
+
+
 async def cmd_devaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/devaudit <url> — Full security audit with fix recommendations for developers"""
     if not await check_force_join(update, context): return
@@ -18797,7 +18972,8 @@ async def cmd_devaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         def _sync_progress(s):
             progress_msgs.append(s)
 
-        result = await asyncio.to_thread(_devaudit_sync, url, _sync_progress)
+        async with scan_semaphore:
+            result = await asyncio.to_thread(_devaudit_sync, url, _sync_progress)
 
         # Flush progress to message
         try:
@@ -18818,8 +18994,12 @@ async def cmd_devaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Add page footer
                 footer = f"\n\n_Page {page_i}/{total_pages}_"
                 text = part + footer if len(part) + len(footer) <= 4000 else part
-                await update.effective_message.reply_text(
-                    text, parse_mode='Markdown')
+                try:
+                    await update.effective_message.reply_text(
+                        text, parse_mode='Markdown')
+                except Exception:
+                    await update.effective_message.reply_text(
+                        re.sub(r'[*_`\[\]]', '', text))
                 await asyncio.sleep(0.3)  # Telegram flood prevention
 
         # Export JSON report
@@ -19286,14 +19466,153 @@ async def _startup_pools(application=None):
     except Exception as e:
         logger.warning("aiosqlite pool startup failed: %s", e)
 
-# ── Backward-compat aliases (must be defined before main()) ──────────────
-cmd_tech_stack    = cmd_tech
-cmd_whois_lookup  = cmd_whois
-cmd_headers_check = cmd_headers
+
+async def cmd_ssl(update, context):
+    """/ssl <domain> [deep] — SSL check (basic) or /ssl deep for full TLS audit"""
+    if not await check_force_join(update, context): return
+    args = context.args or []
+    if args and args[-1].lower() == 'deep':
+        context.args = [a for a in args if a.lower() != 'deep']
+        await cmd_ssltls_deep(update, context)
+    else:
+        await cmd_ssl_check(update, context)
+
+
+async def cmd_cors(update, context):
+    """/cors <url> [deep] — CORS check or /cors deep for full audit"""
+    if not await check_force_join(update, context): return
+    args = context.args or []
+    if args and args[-1].lower() == 'deep':
+        context.args = [a for a in args if a.lower() != 'deep']
+        await cmd_cors_deep(update, context)
+    else:
+        await cmd_cors_check(update, context)
+
+
+async def cmd_fix(update, context):
+    """/fix <url> [roadmap|guide|hardening|nginx|php|django|laravel|node]
+    Unified fix command:
+      /fix <url>           → fix roadmap (prioritized)
+      /fix <url> guide     → detailed fix guide
+      /fix <url> hardening → server hardening checklist
+      /fix <url> nginx     → nginx hardening
+      /fix <url> php       → PHP hardening
+    """
+    if not await check_force_join(update, context): return
+    args = list(context.args or [])
+    if not args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/fix <url> [mode]`\n\n"
+            "*Modes:*\n"
+            "  `/fix <url>` — Priority fix roadmap\n"
+            "  `/fix <url> guide` — Detailed fix guide\n"
+            "  `/fix <url> hardening` — Server hardening\n"
+            "  `/fix <url> nginx|php|django|laravel|node` — Stack-specific\n\n"
+            "💡 _Run `/pentest` or `/devaudit` first to find issues_",
+            parse_mode='Markdown')
+        return
+    # Check last arg for mode
+    mode = args[-1].lower() if len(args) > 1 else ''
+    if mode in ('guide',):
+        context.args = args[:-1]
+        await cmd_fixguide(update, context)
+    elif mode in ('hardening', 'nginx', 'php', 'django', 'laravel', 'node'):
+        context.args = args[1:] if len(args) > 1 else ['']
+        await cmd_hardening(update, context)
+    else:
+        await cmd_fixall(update, context)
+
+
+async def cmd_audit(update, context):
+    """/audit <url> [owasp|report|history]
+    Unified audit command:
+      /audit <url>         → Full developer security audit
+      /audit <url> owasp   → OWASP security report
+      /audit <url> report  → Export full pentest report
+      /audit history       → View scan history
+    """
+    if not await check_force_join(update, context): return
+    args = list(context.args or [])
+    if not args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/audit <url> [mode]`\n\n"
+            "*Modes:*\n"
+            "  `/audit <url>` — Full security audit (recommended)\n"
+            "  `/audit <url> owasp` — OWASP report\n"
+            "  `/audit <url> report` — Export full report\n"
+            "  `/audit history` — View your scan history\n\n"
+            "💡 _Tip: `/audit` → `/fix` for complete workflow_",
+            parse_mode='Markdown')
+        return
+    mode = args[-1].lower() if len(args) > 1 else ''
+    if args[0].lower() == 'history' or mode == 'history':
+        context.args = []
+        await cmd_scan_history(update, context)
+    elif mode == 'owasp':
+        context.args = args[:-1]
+        await cmd_secreport(update, context)
+    elif mode == 'report':
+        context.args = args[:-1]
+        await cmd_report(update, context)
+    else:
+        await cmd_devaudit(update, context)
+
+# ══════════════════════════════════════════════════════════════════════
+# 🔍 UNIFIED COMMANDS — Merged from multiple overlapping commands
+# ══════════════════════════════════════════════════════════════════════
+
+async def cmd_scan_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/scan_single <engine> <url> — Run one specific scan engine.
+    Engines: sqli | xss | ssrf | lfi | auth
+    Example: /scan_single sqli https://example.com
+    """
+    if not await check_force_join(update, context): return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid, heavy=True)
+    if not allowed:
+        await update.effective_message.reply_text(
+            f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/scan_single <engine> <url>`\n\n"
+            "*Engines:*\n"
+            "  `sqli` — SQL Injection\n"
+            "  `xss`  — Cross-Site Scripting\n"
+            "  `ssrf` — SSRF + Open Redirect\n"
+            "  `lfi`  — LFI / Path Traversal\n"
+            "  `auth` — Auth Weaknesses\n\n"
+            "💡 _For all engines: use `/pentest <url>`_",
+            parse_mode='Markdown')
+        return
+    engine = args[0].lower()
+    context.args = args[1:]
+    engine_map = {
+        'sqli': (cmd_sqlitest, 'SQL Injection'),
+        'xss':  (cmd_xsstest,  'XSS'),
+        'ssrf': (cmd_ssrftest, 'SSRF'),
+        'lfi':  (cmd_lfitest,  'LFI'),
+        'auth': (cmd_authtest, 'Auth'),
+    }
+    if engine not in engine_map:
+        await update.effective_message.reply_text(
+            f"❌ Unknown engine `{engine}`\nValid: `sqli xss ssrf lfi auth`",
+            parse_mode='Markdown')
+        return
+    func, label = engine_map[engine]
+    await func(update, context)
+
+
+# ── Backward-compat aliases (must be before main()) ──────────────────────
+cmd_tech_stack     = cmd_tech
+cmd_whois_lookup   = cmd_whois
+cmd_headers_check  = cmd_headers
 cmd_subdomain_enum = cmd_subdomains
 
+
 def main():
-    # ── Single-instance lock (prevents Conflict on Railway redeploy) ──────
+    # ── Single-instance lock (prevents Conflict on Railway redeploy) ───
     import fcntl
     _lock_file_path = os.path.join(DATA_DIR, "bot.lock")
     _lock_file = open(_lock_file_path, "w")
@@ -19302,26 +19621,18 @@ def main():
         _lock_file.write(str(os.getpid()))
         _lock_file.flush()
     except OSError:
-        print("❌ Another bot instance is already running (lock file held). Exiting.")
-        logger.error("Startup blocked — another instance holds the lock at %s", _lock_file_path)
+        print("❌ Another bot instance is already running. Exiting.")
+        logger.error("Startup blocked — another instance holds the lock")
         return
 
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("═"*55)
-        print("❌  TOKEN ထည့်ဖို့ မမေ့ပါနဲ့ (Line 70 တွင် directly ထည့်ပါ)")
-        print("═"*55)
-        return
-
-    # ── Build app with Railway-optimized timeouts ─────
-    # v46: High-performance connection pool
+    # ── Build app ────────────────────────────────────────────────────
     request = HTTPXRequest(
-        connection_pool_size   = 64,   # Significantly higher pool for parallel extraction
-        connect_timeout        = 10.0, # Faster connection
-        read_timeout           = 60.0, # Longer read for heavy assets
-        write_timeout          = 30.0,
-        pool_timeout           = 30.0,
+        connection_pool_size = 64,
+        connect_timeout      = 10.0,
+        read_timeout         = 60.0,
+        write_timeout        = 30.0,
+        pool_timeout         = 30.0,
     )
-    # ── Fixed for Python 3.13 + v20.8 compatibility ─────
     app = (Application.builder()
         .token(BOT_TOKEN)
         .request(request)
@@ -19329,155 +19640,131 @@ def main():
         .build()
     )
 
-    # ── v51: Start async cache GC background loop ──
+    # ── Async primitives ─────────────────────────────────────────────
     asyncio.ensure_future(_async_cache_gc_loop())
-    logger.info("v51: Async cache GC loop started")  # async GC loop started
-    # ── Init asyncio primitives (event loop must be running) ─
+    logger.info("v51: Async cache GC loop started")
     global download_semaphore, scan_semaphore, _active_scans, db_lock, _dl_queue
-    download_semaphore = asyncio.Semaphore(MAX_WORKERS)
-    scan_semaphore     = asyncio.Semaphore(5)   # 5 concurrent heavy scans globally
-    # Per-user scan semaphore: max 1 heavy scan per user at a time
     global _user_scan_slots
-    _user_scan_slots = {}   # {uid: asyncio.Semaphore(1)}
+    download_semaphore = asyncio.Semaphore(MAX_WORKERS)
+    scan_semaphore     = asyncio.Semaphore(5)
+    _user_scan_slots   = {}
     db_lock            = asyncio.Lock()
     _dl_queue          = asyncio.Queue(maxsize=QUEUE_MAX)
 
     # ════════════════════════════════════════════
-    # 📋  COMMAND HANDLERS
+    # 📋  COMMAND HANDLERS  (v52 — clean & organized)
     # ════════════════════════════════════════════
+    CH = CommandHandler
 
-    # ── Core ──────────────────────────────────────
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("help",      cmd_help))
-    app.add_handler(CommandHandler("status",    cmd_status))
-    app.add_handler(CommandHandler("history",   cmd_history))
-    app.add_handler(CommandHandler("mystats",   cmd_mystats))
-    app.add_handler(CommandHandler("stop",      cmd_stop))
-    app.add_handler(CommandHandler("resume",    cmd_resume))
+    # ── Core ──────────────────────────────────────────────────────────────
+    app.add_handler(CH("start",       cmd_start))
+    app.add_handler(CH("help",        cmd_help))
+    app.add_handler(CH("status",      cmd_status))
+    app.add_handler(CH("history",     cmd_history))
+    app.add_handler(CH("mystats",     cmd_mystats))
+    app.add_handler(CH("stop",        cmd_stop))
+    app.add_handler(CH("resume",      cmd_resume))
+    app.add_handler(CH("afterdl",     cmd_afterdl))
 
-    # ── Download (merged: /download /fullsite /jsdownload /jsfullsite) ──
-    app.add_handler(CommandHandler("dl",        cmd_dl))
+    # ── Download ──────────────────────────────────────────────────────────
+    app.add_handler(CH("dl",          cmd_dl))
 
-    # ── Security Scanner (merged: /vuln /fuzz /smartfuzz /bypass403) ──
-    app.add_handler(CommandHandler("scan",      cmd_scan))
+    # ── RECON & INFO ──────────────────────────────────────────────────────
+    # /recon <url>                    — full recon (headers+cookies+robots+tech)
+    # /info <domain> [sub|whois|dns]  — WHOIS + DNS + subdomains unified
+    # /scan <url>                     — quick combined vuln scan
+    app.add_handler(CH("recon",       cmd_recon))
+    app.add_handler(CH("info",        cmd_info_unified))
+    app.add_handler(CH("scan",        cmd_scan))
+    app.add_handler(CH("site_map",    cmd_site_map))
+    app.add_handler(CH("port_scan",   cmd_port_scan))
+    app.add_handler(CH("screenshot",  cmd_screenshot))
+    app.add_handler(CH("monitor",     cmd_monitor))
 
-    # ── Recon (merged: /tech /headers /whois /cookies /robots /links) ──
-    app.add_handler(CommandHandler("recon",     cmd_recon))
+    # ── DISCOVERY ─────────────────────────────────────────────────────────
+    # /discover <url>                 — deep API + secret discovery
+    # /api <url>                      — admin panel + API endpoint unified
+    # /fuzz <url> [paths|dirs|params|smart]
+    # /waf <url>                      — WAF fingerprint + Cloudflare origin
+    app.add_handler(CH("discover",    cmd_discover))
+    app.add_handler(CH("api",         cmd_api_unified))
+    app.add_handler(CH("fuzz",        cmd_fuzz_unified))
+    app.add_handler(CH("waf",         cmd_waf))
+    app.add_handler(CH("shodan_lite", cmd_shodan_lite))
+    app.add_handler(CH("cloudcheck",  cmd_cloudcheck))   # compat alias
 
-    # ── Discovery (merged: /extract /subdomains) ──
-    app.add_handler(CommandHandler("discover",  cmd_discover))
-    app.add_handler(CommandHandler("api",          cmd_api))          # Admin Panel Finder (v41)
-    app.add_handler(CommandHandler("api_discover", cmd_api_discover)) # API Endpoint Discovery
+    # ── PENTEST ───────────────────────────────────────────────────────────
+    # /pentest <url>                  — full pentest: SQLi+XSS+SSRF+LFI+Auth
+    app.add_handler(CH("pentest",     cmd_pentest))
+    app.add_handler(CH("sqlitest",    cmd_sqlitest))
+    app.add_handler(CH("xsstest",     cmd_xsstest))
+    app.add_handler(CH("ssrf",        cmd_ssrftest))
+    app.add_handler(CH("lfi",         cmd_lfitest))
+    app.add_handler(CH("auth",        cmd_authtest))
+    app.add_handler(CH("xxe",         cmd_xxe))
+    app.add_handler(CH("jwtattack",   cmd_jwtattack))
+    app.add_handler(CH("bruteforce",  cmd_bruteforce))
+    app.add_handler(CH("autopwn",     cmd_autopwn))
+    app.add_handler(CH("paramfuzz",   cmd_paramfuzz))
+    app.add_handler(CH("bypass403",   cmd_bypass403))
+    app.add_handler(CH("ratelimit_test", cmd_ratelimit_test))
+    app.add_handler(CH("nuclei_lite",    cmd_nuclei_lite))
+    app.add_handler(CH("bola",        cmd_bola))
+    app.add_handler(CH("oauth_steal", cmd_oauth_steal))
+    app.add_handler(CH("idor_uuid_leak",  cmd_idor_uuid_leak))
+    app.add_handler(CH("api_mass_assign", cmd_api_mass_assign))
+    app.add_handler(CH("graphql_batch",   cmd_graphql_batch))
+    app.add_handler(CH("smuggle",     cmd_smuggle))       # UNIFIED: http1 + h2c modes
 
-    # ── Monitoring ────────────────────────────────
-    app.add_handler(CommandHandler("monitor",   cmd_monitor))
+    # ── SECURITY CHECKS ───────────────────────────────────────────────────
+    # /ssl <domain> [deep]            — SSL check OR /ssl deep → deep TLS audit
+    # /cors <url> [deep]              — CORS check OR /cors deep → deep audit
+    app.add_handler(CH("ssl",         cmd_ssl))
+    app.add_handler(CH("cors",        cmd_cors))
+    app.add_handler(CH("secretscan",  cmd_secretscan))
+    app.add_handler(CH("gitexposed",  cmd_gitexposed))
+    app.add_handler(CH("sourcemap",   cmd_sourcemap))
+    app.add_handler(CH("extract",     cmd_extract))
+    app.add_handler(CH("sensitive",   cmd_sensitive))
 
-    # ── Standalone tools ──────────────────────────
-    app.add_handler(CommandHandler("screenshot",cmd_screenshot))
-    app.add_handler(CommandHandler("appassets", cmd_appassets))
-    app.add_handler(CommandHandler("jwtattack", cmd_jwtattack))
+    # ── AUDIT & FIX ───────────────────────────────────────────────────────
+    # /audit <url> [report|fix|hard]  — UNIFIED: devaudit + secreport + fixall + hardening
+    # /fix <url> [guide|nginx|php|django|laravel|node]
+    app.add_handler(CH("audit",       cmd_audit))
+    app.add_handler(CH("fix",         cmd_fix))
+    app.add_handler(CH("analyze",     cmd_analyze))
+    app.add_handler(CH("codeaudit",   cmd_codeaudit))
+    app.add_handler(CH("apitest",     cmd_apitest))
+    app.add_handler(CH("report",      cmd_report))
+    app.add_handler(CH("scan_history",cmd_scan_history))
 
-    # ── Admin ─────────────────────────────────────
-    app.add_handler(CommandHandler("admin",     cmd_admin))
-    app.add_handler(CommandHandler("ban",       cmd_ban))
-    app.add_handler(CommandHandler("unban",     cmd_unban))
-    app.add_handler(CommandHandler("userinfo",  cmd_userinfo))
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    app.add_handler(CommandHandler("allusers",  cmd_allusers))
-    app.add_handler(CommandHandler("setforcejoin", cmd_setforcejoin))
-    app.add_handler(CommandHandler("sys",       cmd_sys))       # merged: /clean /disk /logs
-    app.add_handler(CommandHandler("adminset",  cmd_adminset))  # merged: /setlimit /setpages /setassets
-    app.add_handler(CommandHandler("botstats",  cmd_botstats))  # NEW: real-time perf dashboard
+    # ── APP ANALYSIS ──────────────────────────────────────────────────────
+    app.add_handler(CH("appassets",   cmd_appassets))
+    app.add_handler(CH("js_restore",  cmd_js_restore))
+    app.add_handler(CH("password_leak_check", cmd_password_leak_check))
 
-    # ── v43 NEW FEATURE HANDLERS ─────────────────────────────────
-    app.add_handler(CommandHandler("tech_stack",          cmd_tech_stack))
-    app.add_handler(CommandHandler("api_fuzzer",          cmd_api_fuzzer))
-    app.add_handler(CommandHandler("password_leak_check", cmd_password_leak_check))
-    app.add_handler(CommandHandler("site_map",            cmd_site_map))
-    app.add_handler(CommandHandler("whois",               cmd_whois))          # v47: enhanced
-    app.add_handler(CommandHandler("whois_lookup",        cmd_whois_lookup))   # backward compat alias
-    app.add_handler(CommandHandler("dns_enum",            cmd_dns_enum))
-    app.add_handler(CommandHandler("port_scan",           cmd_port_scan))
-    app.add_handler(CommandHandler("ssl_check",           cmd_ssl_check))
-    app.add_handler(CommandHandler("headers_check",       cmd_headers_check))
-    app.add_handler(CommandHandler("waf_detect",          cmd_waf_detect))
-    app.add_handler(CommandHandler("cors_check",          cmd_cors_check))
-    app.add_handler(CommandHandler("dir_brute",           cmd_dir_brute))
-    app.add_handler(CommandHandler("subdomain_enum",      cmd_subdomain_enum))
-    app.add_handler(CommandHandler("cms_detect",          cmd_cms_detect))
-    app.add_handler(CommandHandler("speed_audit",         cmd_speed_audit))
+    # ── PROXY ─────────────────────────────────────────────────────────────
+    # /proxy [dl|status|refresh|add]
+    app.add_handler(CH("proxy",       cmd_proxy))
 
+    # ── ADMIN ─────────────────────────────────────────────────────────────
+    app.add_handler(CH("admin",       cmd_admin))
+    app.add_handler(CH("ban",         cmd_ban))
+    app.add_handler(CH("unban",       cmd_unban))
+    app.add_handler(CH("userinfo",    cmd_userinfo))
+    app.add_handler(CH("broadcast",   cmd_broadcast))
+    app.add_handler(CH("allusers",    cmd_allusers))
+    app.add_handler(CH("setforcejoin",cmd_setforcejoin))
+    app.add_handler(CH("sys",         cmd_sys))
+    app.add_handler(CH("adminset",    cmd_adminset))
+    app.add_handler(CH("botstats",    cmd_botstats))
+    app.add_handler(CH("resetquota",  cmd_resetquota))
+    app.add_handler(CH("gofileinfo",  cmd_gofileinfo))
+    app.add_handler(CH("cleandl",     cmd_cleandl))
 
-    # ── File upload handler ────────────────────────
+    # ── FILE UPLOAD ───────────────────────────────────────────────────────
     app.add_handler(MessageHandler(filters.Document.ALL, handle_app_upload))
 
-    # ── V20 New Feature Commands ──────────────────
-    app.add_handler(CommandHandler("cloudcheck", cmd_cloudcheck))
-    app.add_handler(CommandHandler("paramfuzz",  cmd_paramfuzz))
-    app.add_handler(CommandHandler("autopwn",    cmd_autopwn))
-    # ── V26 New Features ──────────────────────────
-    app.add_handler(CommandHandler("bruteforce", cmd_bruteforce))
-    app.add_handler(CommandHandler("sourcemap",  cmd_sourcemap))
-    app.add_handler(CommandHandler("gitexposed", cmd_gitexposed))
-    # ── v28.1 New Scanners ────────────────────────
-    app.add_handler(CommandHandler("secretscan",   cmd_secretscan))
-
-    # ── v50 Unified Commands ──────────────────────────────
-    app.add_handler(CommandHandler("info",         cmd_info))         # /whois + /dns_enum
-    app.add_handler(CommandHandler("waf",          cmd_waf))          # /waf_detect + /cloudcheck
-    app.add_handler(CommandHandler("apiunified",   cmd_api_unified))  # /api combined
-    app.add_handler(CommandHandler("resetquota",   cmd_resetquota))   # admin quota reset
-
-    # ── v48.1 Offensive + Defensive Toolkit ─────────────
-    app.add_handler(CommandHandler("pentest",   cmd_pentest))    # Full pentest: SQLi+XSS+SSRF+LFI+Auth
-    app.add_handler(CommandHandler("sqlitest",  cmd_sqlitest))   # SQL injection deep test
-    app.add_handler(CommandHandler("xsstest",   cmd_xsstest))    # XSS test
-    app.add_handler(CommandHandler("ssrf",      cmd_ssrftest))   # SSRF + open redirect
-    app.add_handler(CommandHandler("lfi",       cmd_lfitest))    # LFI path traversal
-    app.add_handler(CommandHandler("auth",      cmd_authtest))   # Auth weakness test
-    app.add_handler(CommandHandler("fixall",    cmd_fixall))     # Combined fix roadmap
-
-    # ── v48 Developer Security Toolkit ──────────────
-    app.add_handler(CommandHandler("devaudit",  cmd_devaudit))   # Full developer security audit
-    app.add_handler(CommandHandler("fixguide",  cmd_fixguide))   # Vulnerability fix guide
-    app.add_handler(CommandHandler("secreport", cmd_secreport))  # OWASP security report
-    app.add_handler(CommandHandler("hardening", cmd_hardening))  # Server hardening checklist
-
-    # ── v31 New Commands ──────────────────────────
-    app.add_handler(CommandHandler("analyze",   cmd_analyze))    # JS secret/route scanner
-    app.add_handler(CommandHandler("apitest",   cmd_apitest))    # API token extractor
-    app.add_handler(CommandHandler("afterdl",   cmd_afterdl))    # guide command
-    app.add_handler(CommandHandler("codeaudit",  cmd_codeaudit))   # backend code audit (PHP/Python)
-    app.add_handler(CommandHandler("gofileinfo", cmd_gofileinfo))  # gofile.io account status (admin)
-    app.add_handler(CommandHandler("cleandl",   cmd_cleandl))     # clean downloaded sources (admin)
-
-    # ── Proxy (v47: unified subcommand) ────────────
-    app.add_handler(CommandHandler("proxy",          cmd_proxy))           # /proxy dl|status|refresh|add
-    app.add_handler(CommandHandler("proxy_download", cmd_proxy_download))  # backward compat
-    app.add_handler(CommandHandler("proxy_status",   cmd_proxy_status))    # backward compat
-    app.add_handler(CommandHandler("proxy_refresh",  cmd_proxy_refresh))   # backward compat
-    app.add_handler(CommandHandler("proxy_add",      cmd_proxy_add))       # backward compat
-
-    # ── v43.5 Advanced Attack Commands ────────────
-    app.add_handler(CommandHandler("smuggle",          cmd_smuggle))          # unified: /smuggle [h2c]
-    app.add_handler(CommandHandler("smuggling_tester", cmd_smuggling_tester)) # backward compat
-    app.add_handler(CommandHandler("h2c_smuggling",    cmd_h2c_smuggling))    # backward compat
-    app.add_handler(CommandHandler("oauth_steal",      cmd_oauth_steal))
-    app.add_handler(CommandHandler("idor_uuid_leak",   cmd_idor_uuid_leak))
-    app.add_handler(CommandHandler("api_mass_assign",  cmd_api_mass_assign))
-    app.add_handler(CommandHandler("graphql_batch",    cmd_graphql_batch))
-    app.add_handler(CommandHandler("js_restore",       cmd_js_restore))
-    app.add_handler(CommandHandler("ssltls_deep",   cmd_ssltls_deep))    # v52: Deep TLS audit
-    app.add_handler(CommandHandler("xxe",            cmd_xxe))             # v52: XXE injection test
-    app.add_handler(CommandHandler("cors_deep",      cmd_cors_deep))       # v52: Deep CORS audit
-    app.add_handler(CommandHandler("ratelimit_test", cmd_ratelimit_test))  # v52: Rate limit test
-    app.add_handler(CommandHandler("nuclei_lite",    cmd_nuclei_lite))     # v52: CVE template lite
-    app.add_handler(CommandHandler("shodan_lite",    cmd_shodan_lite))     # v52: Passive recon
-    app.add_handler(CommandHandler("report",         cmd_report))          # v52: Full report export
-    app.add_handler(CommandHandler("scan_history",   cmd_scan_history))    # v52: Scan history
-
-
-    # ── Callbacks ─────────────────────────────────
     app.add_handler(CallbackQueryHandler(force_join_callback,    pattern="^fj_check$"))
     app.add_handler(CallbackQueryHandler(appassets_cat_callback, pattern="^apa_"))
     app.add_handler(CallbackQueryHandler(admin_callback,         pattern="^adm_"))
@@ -19502,6 +19789,7 @@ def main():
 
     # ── Bug fix: _start_background defined OUTSIDE retry loop ──
     async def _start_background(application):
+
         """Background tasks + set bot command list"""
         global _monitor_app_ref
         _monitor_app_ref = application
@@ -20672,7 +20960,8 @@ async def cmd_autopwn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             base_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
             pq = []
-            fuzz_results, _ = await asyncio.to_thread(_fuzz_sync, base_url, "paths", pq)
+            async with scan_semaphore:
+                fuzz_results, _ = await asyncio.to_thread(_fuzz_sync, base_url, "paths", pq)
             report["fuzz"] = fuzz_results[:20]
             critical_paths = [r for r in fuzz_results if r["status"] == 200 and
                               any(w in r["url"].lower() for w in
@@ -21365,7 +21654,8 @@ async def cmd_sourcemap(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     task = asyncio.create_task(_progress())
     try:
-        result = await asyncio.to_thread(_sourcemap_sync, url, progress_q)
+        async with scan_semaphore:
+            result = await asyncio.to_thread(_sourcemap_sync, url, progress_q)
     finally:
         task.cancel()
         _active_scans.pop(uid, None)
@@ -21640,7 +21930,8 @@ async def cmd_gitexposed(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     task = asyncio.create_task(_progress())
     try:
-        result = await asyncio.to_thread(_gitexposed_sync, url, progress_q)
+        async with scan_semaphore:
+            result = await asyncio.to_thread(_gitexposed_sync, url, progress_q)
     finally:
         task.cancel()
         _active_scans.pop(uid, None)
@@ -24492,6 +24783,42 @@ async def cmd_site_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════
 
 # /whois_lookup → alias to /whois (merged)
+
+
+
+async def cmd_info_unified(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /info <domain> [mode]
+    Unified domain info:
+      /info <domain>       — WHOIS + DNS combined
+      /info <domain> sub   — subdomain enumeration
+      /info <domain> whois — WHOIS only
+      /info <domain> dns   — DNS records only
+    """
+    if not await check_force_join(update, context): return
+    args = context.args or []
+    if not args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:*\n"
+            "  `/info <domain>`       — WHOIS + DNS + RDAP\n"
+            "  `/info <domain> sub`   — Subdomain enumeration\n"
+            "  `/info <domain> whois` — WHOIS only\n"
+            "  `/info <domain> dns`   — DNS records only\n",
+            parse_mode='Markdown')
+        return
+    mode = args[-1].lower() if len(args) > 1 else "full"
+    if mode in ("sub", "whois", "dns"):
+        context.args = args[:-1] if len(args) > 1 else args
+    else:
+        mode = "full"
+    if mode == "sub":
+        await cmd_subdomains(update, context)
+    elif mode == "whois":
+        await cmd_whois(update, context)
+    elif mode == "dns":
+        await cmd_dns_enum(update, context)
+    else:
+        await cmd_info(update, context)
 
 
 async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
