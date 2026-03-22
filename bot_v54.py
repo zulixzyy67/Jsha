@@ -243,9 +243,10 @@ JS_RENDER       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "js_r
 
 DAILY_LIMIT           = int(os.getenv("DAILY_LIMIT", "10"))   # downloads per user per day
 # v46: High-Performance Configuration
-MAX_WORKERS           = 16    # Parallel extraction workers
-MAX_PAGES             = 1000  # Deep crawling page limit
-MAX_ASSETS            = 10000 # Large site asset limit
+MAX_WORKERS           = int(os.getenv("MAX_WORKERS", "24"))  # v54: more parallel workers
+CHUNK_PAGES           = int(os.getenv("CHUNK_PAGES", "100"))  # pages per zip chunk
+MAX_PAGES             = int(os.getenv("MAX_PAGES", "1000"))  # v54: full site (env override)
+MAX_ASSETS            = int(os.getenv("MAX_ASSETS", "5000"))  # v54: full assets (env override)
 TIMEOUT               = int(os.getenv("TIMEOUT", "90"))       # v54: increased for slow sites
 TIMEOUT_WARN          = int(os.getenv("TIMEOUT_WARN", "50"))
 SPLIT_MB              = 45
@@ -2548,7 +2549,7 @@ def _fetch_page_sync(url: str, use_js: bool = False) -> tuple:
             allow_redirects=True,
         )
 
-    MAX_FETCH_RETRIES = 4
+    MAX_FETCH_RETRIES = 3  # v54: 3 retries (was 4) — fail faster on dead sites
     for attempt in range(MAX_FETCH_RETRIES):
         try:
             resp = _do_fetch(verify=True, referer=origin if attempt > 0 else None)
@@ -4369,7 +4370,7 @@ def discover_api_endpoints(base_url: str, progress_cb=None) -> dict:
         fmap = {ex.submit(_probe, path): path for path in all_probe_paths}
         done = 0
         try:
-            for fut in concurrent.futures.as_completed(fmap, timeout=180):
+            for fut in concurrent.futures.as_completed(fmap, timeout=300):
                 done += 1
                 try:
                     result = fut.result(timeout=8)
@@ -6866,7 +6867,7 @@ def download_website(
                 session.headers[k.strip()] = v.strip()
 
     # ── Constants ────────────────────────────────────────────────────
-    TIMEOUT_VAL       = int(os.getenv("TIMEOUT", "45"))   # type: ignore[name-defined]
+    TIMEOUT_VAL       = TIMEOUT  # v54: use global TIMEOUT (90s) not hardcoded 45s
     max_bytes         = int(os.getenv("APP_MAX_MB", "150")) * 1024 * 1024  # type: ignore[name-defined]
     MAX_SINGLE_BYTES  = 50 * 1024 * 1024   # 50 MB per asset hard cap
     CHUNK_SIZE        = 131072             # 128 KB streaming chunk
@@ -6900,7 +6901,7 @@ def download_website(
 
     # ── Phase 1: Pages (Multi-threaded) ──────────────────────────────
     seen_q: set = set(queue)
-    PAGE_WORKERS = max(1, min(ASSET_WORKERS, 4))  # Pages are heavier, use fewer workers
+    PAGE_WORKERS = max(1, min(ASSET_WORKERS, 8))  # v54: up to 8 parallel page workers
     
     def _process_page(url: str):
         nu = _normalize(url)
@@ -6961,7 +6962,8 @@ def download_website(
                     stats['failed'] += 1
 
                 if progress_cb:
-                    _pg_denom = max_pages if full_site else max(stats['pages'], 1)
+                    _total_found = stats['pages'] + len(queue)
+                    _pg_denom = max(_total_found, stats['pages'], 1)
                     bar = pbar(stats['pages'], _pg_denom)
                     progress_cb(
                         f"📄 *Pages* ⚡×{PAGE_WORKERS}\n`{bar}`\n"
@@ -7072,7 +7074,7 @@ def download_website(
                 resp = session.get(
                     asset_url,
                     headers=_get_headers(),  # type: ignore[name-defined]
-                    timeout=(8, TIMEOUT_VAL),   # (connect_timeout, read_timeout)
+                    timeout=(15, TIMEOUT_VAL),  # v54: connect=15s
                     stream=True,
                 )
 
@@ -7275,7 +7277,7 @@ def download_website(
         try:
             resp = session.get(
                 asset_url,
-                timeout=(8, TIMEOUT_VAL),
+                timeout=(15, TIMEOUT_VAL),  # v54: connect=15s
                 stream=True,
             )
             resp.raise_for_status()
@@ -12350,7 +12352,7 @@ async def _run_download(
                         download_website, url, full_site, use_js, mp, ma, sync_cb, resume_mode,
                         None, max_depth, cookies, extra_headers
                     ),
-                    timeout=TIMEOUT + 60 # Add 60 seconds buffer to global TIMEOUT
+                    timeout=max(600, min(7200, int(mp) * 6))  # v54: dynamic — 6s/page, 10min min, 2hr max
                 )
             except asyncio.TimeoutError:
                 raise TimeoutError("Download process exceeded overall time limit")
@@ -12360,7 +12362,7 @@ async def _run_download(
             err_detail = str(e)[:80] if err_name == "NameError" else ""
             err_hint = {
                 "ConnectionError":  "🌐 ဆာဗာနဲ့ ချိတ်ဆက်မရပါ",
-                "TimeoutError":     "⏱️ Response timeout ဖြစ်သွားတယ် — site တုံ့ပြန်နှေးနိုင်တယ်",
+                "TimeoutError":     "⏱️ Timeout — site တုံ့ပြန်နှေးသည် သို့မဟုတ် connection ပြတ်သည်\n💡 `/resume <url>` နှိပ်ပြီး ဆက်ဆွဲနိုင်သည်",
                 "SSLError":         "🔒 SSL certificate ပြဿနာ",
                 "TooManyRedirects": "🔄 Redirect loop ဖြစ်နေတယ်",
             }.get(err_name, f"⚠️ {err_name}" + (f": `{err_detail}`" if err_detail else ""))
@@ -14049,11 +14051,11 @@ async def cmd_dl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  ⚡ `js`     — Single page + JS render\n"
             "  🚀 `jsful`  — Full site + JS render\n\n"
             "*Options:*\n"
-            "  `--depth N`   — Crawl depth (1-10)\n"
+            "  `--depth N`   — Crawl depth (1-10, default: 5)\n"
             "  `--cookie X`  — Session cookie\n"
             "  `--header X`  — Custom header (`Key: Value`)\n"
             "  `--proxy X`   — Use proxy (e.g. `http://user:pass@host:port`)\n"
-            "  `--exclude X` — Exclude paths (comma separated)\n\n"
+            "  `--exclude X` — Exclude paths (comma separated)\n"            "\n💡 *Tip:* Large site ဆိုရင် `--depth 1` or `--depth 2` သုံးပါ\n\n"
             "*Examples:*\n"
             "  `/dl https://example.com full --depth 3`\n"
             "  `/dl https://app.com --cookie session=xyz123`\n"
@@ -27622,56 +27624,67 @@ async def cmd_admin_unified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #     step-by-step fix guide + code snippets
 # ══════════════════════════════════════════════════════════════════
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-async def _call_claude_fix(vuln_report: str, url: str) -> str:
-    """Call Claude API to generate fix guide from scan results."""
-    if not ANTHROPIC_API_KEY:
-        return "❌ ANTHROPIC_API_KEY environment variable မသတ်မှတ်ရသေးပါ။"
+async def _call_gemini_fix(vuln_report: str, url: str) -> str:
+    """Call Gemini API (free) to generate fix guide from scan results."""
+    if not GEMINI_API_KEY:
+        return (
+            "❌ GEMINI_API_KEY မသတ်မှတ်ရသေးပါ\n\n"
+            "Railway → Variables → New Variable:\n"
+            "Name: GEMINI_API_KEY\n"
+            "Value: AIza...\n\n"
+            "Free key ရယူရန်: aistudio.google.com/app/apikey"
+        )
     import aiohttp as _aio
+    report_trimmed = vuln_report[:3000] if len(vuln_report) > 3000 else vuln_report
     prompt = (
-        f"You are a security expert helping a developer fix vulnerabilities.\n"
+        f"You are a security expert helping a developer fix website vulnerabilities.\n"
         f"Website: {url}\n\n"
-        f"Scan findings:\n{vuln_report}\n\n"
+        f"Security scan findings:\n{report_trimmed}\n\n"
         f"For each vulnerability found:\n"
-        f"1. Explain what it is (1-2 sentences in simple terms)\n"
-        f"2. Show the fix with actual code snippet (Python/JS/Nginx/Apache config as appropriate)\n"
-        f"3. Priority: Critical/High/Medium\n\n"
-        f"Format each fix as:\n"
-        f"**[Priority] Vulnerability Name**\n"
-        f"Problem: ...\n"
-        f"Fix:\n```language\ncode here\n```\n\n"
-        f"Be concise. Focus on actionable fixes. Use Myanmar language for explanations, English for code."
+        f"- Explain briefly in Myanmar language\n"
+        f"- Provide exact fix code (Nginx / Python / JS / Apache config)\n"
+        f"- Label: Critical / High / Medium\n\n"
+        f"Format:\n"
+        f"**[Priority] Issue Name**\n"
+        f"ပြဿနာ: (Myanmar explanation)\n"
+        f"Fix:\n```\ncode here\n```"
     )
+    api_url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    )
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 2000, "temperature": 0.3}
+    }
     try:
         async with _aio.ClientSession() as sess:
             async with sess.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-sonnet-4-5",
-                    "max_tokens": 2000,
-                    "messages": [{"role": "user", "content": prompt}]
-                },
+                api_url,
+                json=body,
+                headers={"content-type": "application/json"},
                 timeout=_aio.ClientTimeout(total=45)
             ) as r:
                 if r.status != 200:
                     try:
-                        err_body = await r.json()
-                        err_msg = err_body.get("error", {}).get("message", str(err_body))[:120]
+                        err = await r.json()
+                        emsg = err.get("error", {}).get("message", str(err))[:200]
                     except Exception:
-                        err_msg = await r.text()
-                        err_msg = err_msg[:120]
-                    return f"❌ Claude API error: HTTP {r.status}\n`{err_msg}`"
+                        emsg = (await r.text())[:200]
+                    return f"❌ Gemini API error: HTTP {r.status}\n{emsg}"
                 data = await r.json()
-                return data["content"][0]["text"]
+                try:
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                except (KeyError, IndexError) as e:
+                    return f"❌ Gemini response parse error: {e}"
+    except _aio.ClientConnectorError as e:
+        return f"❌ Cannot reach Gemini API: {e}"
+    except asyncio.TimeoutError:
+        return "❌ Gemini API timeout — 45s ကျော်သွားတယ်"
     except Exception as e:
-        return f"❌ Claude API failed: {type(e).__name__}: {str(e)[:80]}"
-
+        return f"❌ Gemini API failed: {type(e).__name__}: {str(e)[:100]}"
 
 async def cmd_fix_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/fix <url> — AI-powered vulnerability scan + fix guide generator"""
@@ -27696,7 +27709,7 @@ async def cmd_fix_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  2️⃣ Vulnerability တွေ ဖော်ထုတ်တယ်\n"
             "  3️⃣ Claude AI နဲ့ fix code + explanation ထုတ်ပေးတယ်\n\n"
             "*Example:* `/fix https://example.com`\n\n"
-            "⚠️ _ANTHROPIC API KEY environment variable လိုအပ်တယ်_",
+            "⚠️ _GEMINI API KEY လိုအပ်တယ် — aistudio.google.com/app/apikey (free)_",
             parse_mode="Markdown"); return
 
     url = args[0].strip()
@@ -27789,7 +27802,7 @@ async def cmd_fix_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
 
         # ── Step 2: Send to Claude API ─────────────────────────
-        fix_guide = await _call_claude_fix(vuln_text, url)
+        fix_guide = await _call_gemini_fix(vuln_text, url)
 
         await msg.edit_text(
             f"🔧 *AI Fix Generator — `{domain}`*\n\n"
