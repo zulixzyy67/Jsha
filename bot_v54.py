@@ -74,6 +74,79 @@ if not BOT_TOKEN:
 if not ADMIN_IDS:
     raise SystemExit("❌ ADMIN_IDS not set! Add your Telegram user ID to Railway environment variables.")
 
+# ══════════════════════════════════════════════════
+# 💎  VIP PLAN CONFIG  — v54
+# ══════════════════════════════════════════════════
+VIP_USERS_FILE = os.path.join(DATA_DIR, "vip_users.json") if 'DATA_DIR' in dir() else "/app/data/vip_users.json"
+
+PLANS = {
+    "monthly": {"label": "Monthly (လစဉ်)",    "price_mmk": 10000, "price_usdt": 2.4,  "days": 30,  "emoji": "1️⃣"},
+    "6months": {"label": "6-Months (၆ လ)",    "price_mmk": 55000, "price_usdt": 13.1, "days": 180, "emoji": "2️⃣"},
+    "yearly":  {"label": "Yearly (၁ နှစ်) 🔥","price_mmk": 60000, "price_usdt": 14.3, "days": 365, "emoji": "3️⃣"},
+}
+
+FREE_LIMITS = {"download":2,"scan":5,"pentest":1,"recon":8,"attack":2,"fuzz":3,"audit":3,"default":5}
+VIP_LIMITS  = {k:9999 for k in FREE_LIMITS}
+
+def _load_vip_users() -> dict:
+    try:
+        if os.path.exists(VIP_USERS_FILE):
+            with open(VIP_USERS_FILE, "r") as f:
+                return json.load(f)
+    except Exception: pass
+    return {}
+
+def _save_vip_users(data: dict):
+    try:
+        os.makedirs(os.path.dirname(VIP_USERS_FILE), exist_ok=True)
+        with open(VIP_USERS_FILE, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logging.warning("_save_vip_users: %s", e)
+
+def is_vip(uid: int) -> bool:
+    if uid in ADMIN_IDS: return True
+    entry = _load_vip_users().get(str(uid))
+    if not entry: return False
+    try: return datetime.strptime(entry["expiry"], "%Y-%m-%d") >= datetime.now()
+    except Exception: return False
+
+def get_vip_info(uid: int):
+    if uid in ADMIN_IDS:
+        return {"plan": "admin", "expiry": "unlimited", "days_left": 9999}
+    entry = _load_vip_users().get(str(uid))
+    if not entry: return None
+    try:
+        expiry = datetime.strptime(entry["expiry"], "%Y-%m-%d")
+        days   = (expiry - datetime.now()).days
+        return None if days < 0 else {**entry, "days_left": days}
+    except Exception: return None
+
+def grant_vip(uid: int, plan_key: str):
+    plan = PLANS[plan_key]
+    vips = _load_vip_users()
+    entry = vips.get(str(uid))
+    if entry:
+        try:
+            base = datetime.strptime(entry["expiry"], "%Y-%m-%d")
+            new_exp = (base if base > datetime.now() else datetime.now()) + timedelta(days=plan["days"])
+        except Exception:
+            new_exp = datetime.now() + timedelta(days=plan["days"])
+    else:
+        new_exp = datetime.now() + timedelta(days=plan["days"])
+    vips[str(uid)] = {"plan": plan_key, "expiry": new_exp.strftime("%Y-%m-%d"),
+                      "granted": datetime.now().strftime("%Y-%m-%d")}
+    _save_vip_users(vips)
+
+def revoke_vip(uid: int):
+    vips = _load_vip_users()
+    vips.pop(str(uid), None)
+    _save_vip_users(vips)
+
+def get_user_limits(uid: int) -> dict:
+    return VIP_LIMITS if (uid in ADMIN_IDS or is_vip(uid)) else FREE_LIMITS
+
+
 # ── DATA_DIR: persistent storage root ──────────────────────────────────
 # Railway: mount a volume at /app/data for persistence across deploys
 # Without a volume, /app/data is ephemeral (wiped on redeploy) — still works fine
@@ -11815,30 +11888,49 @@ async def cmd_bola(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         _active_scans.pop(uid, None)
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start — Welcome message with VIP plan status"""
+    uid  = update.effective_user.id
+    name = update.effective_user.first_name or "User"
+    vip  = get_vip_info(uid)
+
+    if vip and vip.get("plan") == "admin":
+        plan_line = "👑 *Admin* — Unlimited access"
+    elif vip:
+        plan_line = f"💎 *VIP Active* — {vip['plan'].capitalize()} | {vip['days_left']} days left"
+    else:
+        plan_line = "🆓 *Free Plan* — `/vip` နှိပ်ပြီး Upgrade လုပ်ပါ"
+
     welcome_text = (
-        "👋 *Welcome to Website Downloader & Security Bot v39*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🙏 *The most powerful tool for web analysis and downloading.*\n\n"
-        "🛠 *Core Features:*\n"
-        "• 📥 `Download` — Full website source with assets\n"
-        "• 🔍 `Recon` — Deep tech stack & header analysis\n"
-        "• 🎯 `Discover` — API endpoints & secret scanning\n"
-        "• 🛡 `Autopwn` — Automated security auditing\n• 📂 `Sensitive` — Brute-force hidden files\n• 🔌 `BOLA` — API IDOR vulnerability test\n\n"
-        "💡 *Tip:* Use the buttons below to explore features or type `/help` for all commands."
+        "🔭 *PhantomScope Security Bot v54*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 {name}  |  {plan_line}\n\n"
+        "*Commands:*\n"
+        "  `/recon <type> <url>` — Recon (12 tools)\n"
+        "  `/scan <type> <url>`  — Passive scan (12 tools)\n"
+        "  `/attack <type> <url>`— Attack test (17 tools)\n"
+        "  `/fuzz <type> <url>`  — Fuzzing (5 tools)\n"
+        "  `/audit <type> <url>` — Code & app audit (10 tools)\n"
+        "  `/report [type]`      — Stats & history\n"
+        "  `/dl <url>`           — Website download\n\n"
+        "📌 *Example:* `/attack sqli https://example.com`\n"
+        "💎 `/vip` — Plan ကြည့်ရန် / Upgrade လုပ်ရန်\n"
+        "⚠️ _Authorized testing only_"
     )
     kb = [
         [
-            InlineKeyboardButton("📥 Download", callback_data="help_download"),
-            InlineKeyboardButton("🔍 Recon", callback_data="help_recon"),
+            InlineKeyboardButton("🕵️ Recon",   callback_data="help_recon"),
+            InlineKeyboardButton("🔍 Scan",    callback_data="help_scan"),
+            InlineKeyboardButton("⚔️ Attack",  callback_data="help_attack"),
         ],
         [
-            InlineKeyboardButton("🎯 Discover", callback_data="help_discover"),
-            InlineKeyboardButton("🛡 Autopwn", callback_data="help_v20"),
+            InlineKeyboardButton("🧪 Fuzz",    callback_data="help_fuzz"),
+            InlineKeyboardButton("🛡️ Audit",   callback_data="help_audit"),
+            InlineKeyboardButton("📊 Report",  callback_data="help_report"),
         ],
         [
-            InlineKeyboardButton("📊 My Stats", callback_data="help_stats"),
-            InlineKeyboardButton("📖 Help Menu", callback_data="help_main"),
-        ]
+            InlineKeyboardButton("💎 VIP Plans",  callback_data="vip_menu"),
+            InlineKeyboardButton("📈 My Stats",   callback_data="help_stats"),
+        ],
     ]
     await update.effective_message.reply_text(
         welcome_text,
@@ -11852,124 +11944,135 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context): return
     args = context.args or []
     
-    # Category-based help
+    # ── v54: Subcommand help categories ────────────────────────────
     categories = {
-        "recon":    ("🔍 Reconnaissance", [
-            ("/info <domain>",       "WHOIS + DNS + RDAP"),
-            ("/info <domain> sub",   "Subdomain enumeration"),
-            ("/info <domain> whois", "WHOIS only"),
-            ("/info <domain> dns",   "DNS records only"),
-            ("/recon <url>",         "Full recon (headers+tech+cookies+links)"),
-            ("/waf <url>",           "WAF fingerprint + Cloudflare bypass"),
-            ("/shodan_lite <domain>","Passive OSINT recon"),
-            ("/site_map <url>",      "Sitemap crawler"),
-            ("/screenshot <url>",    "Website screenshot"),
+        "recon": ("🕵️ /recon — Reconnaissance (12 tools)", [
+            ("/recon info <url>",       "Full info — IP, tech, headers, DNS"),
+            ("/recon whois <url>",      "WHOIS domain registration"),
+            ("/recon subdomains <url>", "Subdomain enumeration"),
+            ("/recon ports <url>",      "Port scan (top 100)"),
+            ("/recon dns <url>",        "DNS record enumeration"),
+            ("/recon waf <url>",        "WAF / firewall detection"),
+            ("/recon cms <url>",        "CMS & tech stack detection"),
+            ("/recon screenshot <url>", "Website screenshot"),
+            ("/recon discover <url>",   "Auto-discover subdomains + paths"),
+            ("/recon shodan <url>",     "Shodan passive intelligence"),
+            ("/recon sitemap <url>",    "Crawl & map all pages"),
+            ("/recon links <url>",      "Extract all links"),
         ]),
-        "scan":     ("🔬 Vulnerability Scanning", [
-            ("/scan <url>",          "Quick multi-check scan"),
-            ("/pentest <url>",       "Full pentest (SQLi+XSS+SSRF+LFI+Auth)"),
-            ("/scan_single sqli <url>","SQL injection only"),
-            ("/scan_single xss <url>", "XSS only"),
-            ("/scan_single ssrf <url>","SSRF + open redirect"),
-            ("/scan_single lfi <url>", "LFI path traversal"),
-            ("/scan_single auth <url>","Auth weaknesses"),
+        "scan": ("🔍 /scan — Passive security scan (12 tools)", [
+            ("/scan all <url>",        "Full scan — headers+ssl+cors+secrets"),
+            ("/scan ssl <url>",        "SSL/TLS certificate check"),
+            ("/scan headers <url>",    "HTTP security headers audit"),
+            ("/scan cors <url>",       "CORS misconfiguration check"),
+            ("/scan secrets <url>",    "Secret / API key leak scan"),
+            ("/scan git <url>",        "Exposed .git repo detection"),
+            ("/scan vuln <url>",       "Passive vulnerability scan"),
+            ("/scan nuclei <url>",     "Nuclei-lite template scan"),
+            ("/scan ratelimit <url>",  "Rate limiting detection"),
+            ("/scan sensitive <url>",  "Sensitive file / path probe"),
+            ("/scan cookies <url>",    "Cookie security flags audit"),
+            ("/scan robots <url>",     "robots.txt analysis"),
         ]),
-        "api":      ("🔌 API & Discovery", [
-            ("/api <url>",           "Admin panel finder"),
-            ("/api <url> discover",  "API endpoint discovery"),
-            ("/api <url> fuzz",      "API fuzzer with 403 bypass"),
-            ("/api <url> test",      "API token extractor"),
-            ("/api <url> all",       "Full API recon (all modes)"),
-            ("/discover <url>",      "Deep API + JS endpoint discovery"),
+        "attack": ("⚔️ /attack — Active attack test (17 tools)", [
+            ("/attack auto <url>",       "AutoPwn — full 7-phase pentest"),
+            ("/attack sqli <url>",       "SQL injection test"),
+            ("/attack xss <url>",        "Cross-site scripting test"),
+            ("/attack ssrf <url>",       "SSRF + open redirect"),
+            ("/attack lfi <url>",        "Local file inclusion"),
+            ("/attack auth <url>",       "Auth weakness & default creds"),
+            ("/attack xxe <url>",        "XML External Entity injection"),
+            ("/attack jwt <token>",      "JWT attack (alg:none, RS→HS)"),
+            ("/attack brute <url>",      "Login brute force"),
+            ("/attack bypass <url>",     "403 Forbidden bypass (50+ techniques)"),
+            ("/attack bola <url>",       "BOLA / IDOR authorization test"),
+            ("/attack idor <url>",       "UUID & resource ID enumeration"),
+            ("/attack oauth <url>",      "OAuth2 redirect URI bypass"),
+            ("/attack smuggle <url>",    "HTTP request smuggling"),
+            ("/attack graphql <url>",    "GraphQL batch / introspection"),
+            ("/attack massassign <url>", "API mass assignment"),
+            ("/attack pentest <url>",    "Full interactive pentest suite"),
         ]),
-        "audit":    ("🛡️ Security Audit & Fixes", [
-            ("/audit <url>",         "Full security audit (recommended)"),
-            ("/audit <url> owasp",   "OWASP security report"),
-            ("/audit <url> report",  "Export full pentest report"),
-            ("/audit history",       "View your scan history"),
-            ("/fix <url>",           "Prioritized fix roadmap"),
-            ("/fix <url> guide",     "Detailed fix guide"),
-            ("/fix <url> hardening", "Server hardening checklist"),
-            ("/fix <url> nginx",     "Nginx hardening guide"),
+        "fuzz": ("🧪 /fuzz — Fuzzing (5 tools)", [
+            ("/fuzz dir <url>",    "Directory & file brute-force"),
+            ("/fuzz params <url>", "Parameter discovery & fuzzing"),
+            ("/fuzz api <url>",    "API endpoint fuzzer"),
+            ("/fuzz smart <url>",  "Smart adaptive fuzzer"),
+            ("/fuzz full <url>",   "Full fuzz — dir+params+api combined"),
         ]),
-        "ssl":      ("🔒 SSL / CORS / WAF", [
-            ("/ssl <domain>",        "SSL certificate check"),
-            ("/ssl <domain> deep",   "Deep TLS/cipher audit"),
-            ("/cors <url>",          "CORS misconfiguration check"),
-            ("/cors <url> deep",     "Deep CORS audit"),
-            ("/waf <url>",           "WAF detect + Cloudflare origin IP"),
-            ("/ratelimit_test <url>","Rate limiting test"),
-            ("/xxe <url>",           "XXE injection test"),
+        "audit": ("🛡️ /audit — Code & app audit (10 tools)", [
+            ("/audit code <url>",      "Static code audit (uploaded file)"),
+            ("/audit api <url>",       "API endpoint structure audit"),
+            ("/audit fix <url>",       "Prioritized fix roadmap"),
+            ("/audit analyze <url>",   "Deep site analysis"),
+            ("/audit sourcemap <url>", "JS source map extraction"),
+            ("/audit extract <url>",   "Asset & resource extraction"),
+            ("/audit password <url>",  "Password leak check (HIBP)"),
+            ("/audit assets <url>",    "App assets downloader"),
+            ("/audit jsrestore <url>", "JS bundle restore"),
         ]),
-        "tools":    ("🛠️ Tools & Utilities", [
-            ("/dl <url>",            "Download website source"),
-            ("/analyze <domain>",    "Analyze downloaded JS source"),
-            ("/fuzz <url>",          "Directory/path fuzzing"),
-            ("/secretscan <url>",    "Scan for leaked secrets"),
-            ("/sourcemap <url>",     "Source map leak detection"),
-            ("/gitexposed <url>",    "Exposed .git detection"),
-            ("/jwtattack <token>",   "JWT attack tests"),
-            ("/bruteforce <url>",    "Login brute force"),
-            ("/paramfuzz <url>",     "Parameter fuzzing"),
-            ("/smuggle <url>",       "HTTP request smuggling"),
-            ("/nuclei_lite <url>",   "CVE template scanner"),
-            ("/codeaudit <domain>",  "Backend code audit"),
+        "report": ("📊 /report — Stats & history", [
+            ("/report history",  "My scan history"),
+            ("/report stats",    "My personal stats + plan info"),
+            ("/report botstats", "Bot-wide statistics (admin)"),
+            ("/report scan",     "Last scan result"),
+            ("/report export",   "Export last report as JSON"),
         ]),
-        "other":    ("📦 Other", [
-            ("/monitor add <url>",   "Page change monitor"),
-            ("/appassets",           "Upload APK/IPA for analysis"),
-            ("/proxy",               "Proxy management"),
-            ("/scan_history",        "View scan history"),
-            ("/mystats",             "Your usage stats"),
-            ("/stop",                "Stop current operation"),
+        "other": ("📦 Other commands", [
+            ("/dl <url>",   "Download website source code"),
+            ("/vip",        "VIP plans & upgrade"),
+            ("/stop",       "Stop current scan / download"),
+            ("/report stats", "Your usage & plan status"),
         ]),
     }
-    
+
     if args and args[0].lower() in categories:
         cat = args[0].lower()
         title, cmds = categories[cat]
-        lines = [f"{title}\n{'━'*22}\n"]
+        lines = [f"*{title}*\n{'━'*22}\n"]
         for cmd, desc in cmds:
-            lines.append(f"  `{cmd}` — {desc}")
-        lines.append(f"\n_Use /help for all categories_")
+            lines.append(f"  `{cmd}`\n    ↳ {desc}")
+        lines.append(f"\n_/help ← categories အားလုံးကြည့်ရန်_")
         await update.effective_message.reply_text(
             "\n".join(lines), parse_mode='Markdown')
         return
-    
-    # Main help menu
-    cat_list = "\n".join(
-        f"  `/help {k}` — {v[0]}" for k, v in categories.items()
-    )
+
+    # ── Main help menu ──────────────────────────────────────────
     msg = (
-        "🤖 *PhantomScope Bot — Command Guide*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "*📂 Categories:*\n"
-        f"{cat_list}\n\n"
-        "*⚡ Quick Start:*\n"
-        "  `/pentest https://example.com` — Full scan\n"
-        "  `/audit https://example.com` — Security audit\n"
-        "  `/api https://example.com all` — API recon\n"
-        "  `/info example.com` — WHOIS + DNS\n\n"
-        "*🔥 Power Commands:*\n"
-        "  `/api <url> all` — Admin + API + Fuzz + Test\n"
-        "  `/audit <url>` — devaudit + OWASP + report\n"
-        "  `/ssl <url> deep` — Full TLS audit\n"
-        "  `/cors <url> deep` — Full CORS audit\n"
-        "  `/info <domain> sub` — Subdomains\n\n"
-        "📊 *Total: 62 commands → 8 unified groups*\n"
+        "🔭 *PhantomScope Bot v54 — Commands*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*Usage:* `/command <type> <url>`\n\n"
+        "🕵️ `/recon` — info · whois · subdomains · ports · dns · waf · cms...\n"
+        "🔍 `/scan`  — all · ssl · headers · cors · secrets · git · vuln...\n"
+        "⚔️ `/attack`— auto · sqli · xss · ssrf · lfi · jwt · brute · bypass...\n"
+        "🧪 `/fuzz`  — dir · params · api · smart · full\n"
+        "🛡️ `/audit` — code · fix · analyze · sourcemap · password...\n"
+        "📊 `/report`— history · stats · export\n"
+        "📥 `/dl`    — Website source download\n"
+        "💎 `/vip`   — VIP plans & upgrade\n\n"
+        "📌 *Quick examples:*\n"
+        "  `/attack sqli https://example.com`\n"
+        "  `/scan all https://example.com`\n"
+        "  `/recon info example.com`\n"
+        "  `/fuzz dir https://example.com`\n\n"
         "⚠️ _Authorized testing only_"
     )
-    kb = [[
-        InlineKeyboardButton("🔍 Recon",   callback_data="help_recon"),
-        InlineKeyboardButton("🔬 Scan",    callback_data="help_scan"),
-        InlineKeyboardButton("🔌 API",     callback_data="help_api"),
-    ],[
-        InlineKeyboardButton("🛡️ Audit",   callback_data="help_audit"),
-        InlineKeyboardButton("🔒 SSL/WAF", callback_data="help_ssl"),
-        InlineKeyboardButton("🛠️ Tools",   callback_data="help_tools"),
-    ],[
-        InlineKeyboardButton("📦 Other",   callback_data="help_other"),
-    ]]
+    kb = [
+        [
+            InlineKeyboardButton("🕵️ Recon",  callback_data="help_recon"),
+            InlineKeyboardButton("🔍 Scan",   callback_data="help_scan"),
+            InlineKeyboardButton("⚔️ Attack", callback_data="help_attack"),
+        ],
+        [
+            InlineKeyboardButton("🧪 Fuzz",   callback_data="help_fuzz"),
+            InlineKeyboardButton("🛡️ Audit",  callback_data="help_audit"),
+            InlineKeyboardButton("📊 Report", callback_data="help_report"),
+        ],
+        [
+            InlineKeyboardButton("📦 Other",  callback_data="help_other"),
+            InlineKeyboardButton("💎 VIP",    callback_data="vip_menu"),
+        ],
+    ]
     await update.effective_message.reply_text(
         msg, parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(kb))
@@ -11979,8 +12082,14 @@ async def help_category_callback(update: Update, context: ContextTypes.DEFAULT_T
     """Handle /help category button presses"""
     query = update.callback_query
     await query.answer()
-    cat = query.data.replace("help_", "")
-    # Delegate to /help with category arg
+    data = query.data
+    if data == "vip_menu":
+        await cmd_vip(update, context)
+        return
+    if data == "help_stats":
+        await cmd_mystats_v2(update, context)
+        return
+    cat = data.replace("help_", "")
     context.args = [cat]
     await cmd_help(update, context)
 
@@ -19752,6 +19861,7 @@ def main():
     app.add_handler(CH("cancel",  cmd_cancel))
     app.add_handler(CH("vip",     cmd_vip))
     app.add_handler(CallbackQueryHandler(vip_callback, pattern="^vip_"))
+    app.add_handler(CallbackQueryHandler(hub_callback, pattern="^hub:"))
 
         # ── FILE UPLOAD ───────────────────────────────────────────────────────
     app.add_handler(MessageHandler(filters.Document.ALL, handle_app_upload))
@@ -19804,101 +19914,26 @@ def main():
         # ── Register bot commands (Telegram "/" menu) ──────────────────
         from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 
-        # ── User commands (all users မြင်ရ) ────────────────────────────
+        # ── User commands — v54 consolidated 10 commands ──────────────
         user_commands = [
-            BotCommand("start",        "🚀 Bot စတင်ရန်"),
-            BotCommand("help",         "📚 Commands အားလုံးကြည့်ရန်"),
-            BotCommand("pentest",      "⚔️ Full pentest: SQLi+XSS+SSRF+LFI+Auth"),
-            BotCommand("info",         "🌐 Domain info: WHOIS+DNS combined"),
-            BotCommand("waf",          "🛡️ WAF detect + origin IP"),
-            BotCommand("apiunified",   "🔌 API find+discover+fuzz combined"),
-            BotCommand("resetquota",   "🔄 Admin: reset user daily quota"),
-            BotCommand("sqlitest",     "💉 SQL injection deep test"),
-            BotCommand("xsstest",      "🕷️ XSS injection test"),
-            BotCommand("ssrf",         "🔁 SSRF + open redirect test"),
-            BotCommand("lfi",          "📁 LFI / path traversal"),
-            BotCommand("auth",         "🔐 Auth weakness test"),
-            BotCommand("fixall",       "🗺️ Combined fix roadmap"),
-            BotCommand("devaudit",     "🛡️ Security audit + fix guide (developer)"),
-            BotCommand("fixguide",     "📖 Vulnerability fix instructions"),
-            BotCommand("secreport",    "📊 OWASP security report"),
-            BotCommand("hardening",    "🔒 Server hardening checklist"),
-            BotCommand("dl",           "📥 Website download"),
-            BotCommand("scan",         "🔍 Full security scan (vuln+fuzz+smart+bypass)"),
-            BotCommand("recon",        "🕵️ Full recon (tech+headers+whois+cookies+robots+links)"),
-            BotCommand("discover",     "🔎 Full discovery (API+secrets+subs+SQLi+XSS)"),
-            BotCommand("secretscan",   "🔑 API keys & secrets finder"),
-            BotCommand("botstats",     "📊 Real-time bot performance dashboard"),
-            BotCommand("cloudcheck",   "☁️ Real IP / CDN bypass"),
-            BotCommand("paramfuzz",    "🧪 Parameter fuzzer"),
-            BotCommand("autopwn",      "⚡ Auto pentest chain"),
-            BotCommand("bruteforce",   "🔑 Login brute force"),
-            BotCommand("gitexposed",   "📁 Git exposure finder"),
-            BotCommand("sourcemap",    "🗺️ Source map extractor"),
-            BotCommand("jwtattack",    "🔐 JWT attack"),
-            BotCommand("screenshot",   "📸 Website screenshot"),
-            BotCommand("monitor",      "👁️ Website monitor"),
-            BotCommand("appassets",    "📦 App asset analyzer"),
-            BotCommand("history",      "📜 Download history"),
-            BotCommand("mystats",      "📊 My stats"),
-            BotCommand("status",       "ℹ️ Bot status"),
-            BotCommand("stop",         "🛑 Stop current scan"),
-            BotCommand("cancel",       "❌ Cancel + queue status (/stop alias)"),
-            BotCommand("resume",       "▶️ Resume download"),
-            BotCommand("analyze",      "🔬 JS secrets/routes scanner (after /dl)"),
-            BotCommand("apitest",      "🔐 API token extractor & tester"),
-            BotCommand("afterdl",      "📖 Guide: what to do after /dl"),
-            BotCommand("codeaudit",    "🔍 Backend code audit PHP/Python (after /dl)"),
-            BotCommand("tech_stack",          "🛠️ Website Tech Stack Checker"),
-            BotCommand("api_fuzzer",          "🚀 Advanced API Fuzzer + 403 Bypass"),
-            BotCommand("password_leak_check", "🔐 Password & Data Breach Checker"),
-            BotCommand("site_map",            "🗺️ Sitemap Discovery & Crawler"),
-            BotCommand("whois_lookup",        "🕵️ Full WHOIS Domain Info"),
-            BotCommand("dns_enum",            "📡 DNS Record Enumeration"),
-            BotCommand("port_scan",           "🔌 Common Port Scanner"),
-            BotCommand("ssl_check",           "🔒 SSL/TLS Certificate Analysis"),
-            BotCommand("headers_check",       "📄 HTTP Security Headers Audit"),
-            BotCommand("waf_detect",          "🛡️ WAF/Firewall Detection"),
-            BotCommand("cors_check",          "🔓 CORS Misconfiguration Scanner"),
-            BotCommand("dir_brute",           "📁 Directory Brute-force"),
-            BotCommand("subdomain_enum",      "🔎 Subdomain Enumeration"),
-            BotCommand("cms_detect",          "📝 CMS Version Detection"),
-            BotCommand("speed_audit",         "⚡ Website Speed & Performance Audit"),
-            # ── v35 Proxy Commands ─────────────────────────────────────────
-            BotCommand("proxy",           "🔄 Proxy manager (dl/status/refresh/add)"),
-            BotCommand("proxy_download",  "🌐 Download through proxy (legacy)"),
-            BotCommand("proxy_status",    "📊 Proxy pool health dashboard"),
-            BotCommand("proxy_refresh",   "🔄 Force re-validate proxy pool"),
-            BotCommand("proxy_add",       "➕ Manually add a proxy"),
-            BotCommand("api",             "🔌 API endpoint tester"),
-            # ── v43.5 Advanced Attack Commands ────────────────────────────
-            BotCommand("smuggle",         "⚔️ HTTP Smuggling (CL.TE/TE.CL/h2c)"),
-            BotCommand("smuggling_tester", "⚔️ HTTP Smuggling legacy alias"),
-            BotCommand("h2c_smuggling",    "⚔️ HTTP/2 Cleartext smuggling"),
-            BotCommand("oauth_steal",      "🔑 OAuth token steal test"),
-            BotCommand("idor_uuid_leak",   "🔓 IDOR + UUID leak detection"),
-            BotCommand("api_mass_assign",  "📦 Mass assignment vulnerability"),
-            BotCommand("graphql_batch",    "📡 GraphQL batch attack"),
-            BotCommand("js_restore",       "🕵️ JS bundle secret restore"),
-            BotCommand("scan_single",     "🔍 Single engine scan"),
-            BotCommand("ssltls_deep",     "🔒 Deep SSL/TLS audit"),
-            BotCommand("cors_deep",       "🔓 Deep CORS policy audit"),
-            BotCommand("report_export",   "📄 Export pentest report"),
+            BotCommand("start",  "🚀 Bot စတင်ရန်"),
+            BotCommand("help",   "📚 Commands မြင်ရန်"),
+            BotCommand("stop",   "🛑 လက်ရှိ scan ရပ်ရန်"),
+            BotCommand("dl",     "📥 Website download"),
+            BotCommand("recon",  "🕵️ Reconnaissance (info/whois/ports/dns/waf/cms...)"),
+            BotCommand("scan",   "🔍 Passive scan (ssl/headers/cors/secrets/vuln...)"),
+            BotCommand("attack", "⚔️ Attack test (sqli/xss/ssrf/lfi/jwt/brute...)"),
+            BotCommand("fuzz",   "🧪 Fuzzing (dir/params/api/smart)"),
+            BotCommand("audit",  "🛡️ Audit (code/fix/analyze/sourcemap...)"),
+            BotCommand("report", "📊 Stats & history"),
+            BotCommand("vip",    "💎 VIP Plans & upgrade"),
         ]
 
-        # ── Admin commands (Admin IDs သာ မြင်ရ) ─────────────────────────
+        # ── Admin commands ───────────────────────────────────────────────
         admin_commands = user_commands + [
-            BotCommand("admin",       "🛠️ Admin panel"),
-            BotCommand("ban",         "🚫 User ban"),
-            BotCommand("unban",       "✅ User unban"),
-            BotCommand("userinfo",    "👤 User info"),
-            BotCommand("broadcast",   "📢 Broadcast message"),
-            BotCommand("allusers",    "👥 All users list"),
-            BotCommand("setforcejoin","📌 Set force join"),
-            BotCommand("sys",         "🖥️ System logs/disk"),
-            BotCommand("adminset",    "⚙️ Bot settings"),
-            BotCommand("gofileinfo",  "☁️ gofile.io account status"),
-            BotCommand("cleandl",     "🗑️ Delete downloaded source folders (admin)"),
+
+            BotCommand("admin",  "🛠️ Admin: ban/unban/vipgrant/broadcast/sys..."),
+            BotCommand("vip",   "💎 VIP grant/revoke/list (admin)"),
         ]
 
         try:
@@ -27156,233 +27191,265 @@ async def cmd_mystats_v2(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════
-# 🎛️  UNIFIED COMMAND DISPATCHERS  — v54 consolidation
-#     72 commands → 10 commands via subcommand routing
+# ══════════════════════════════════════════════════════════════════
+# 🎛️  BUTTON-BASED UNIFIED DISPATCHERS  — v54
+#     /attack <url> → shows inline keyboard → button tap → runs tool
 # ══════════════════════════════════════════════════════════════════
 
-def _unified_url(args: list) -> tuple:
-    """Extract (sub, url) from args. Returns ('','') if missing."""
-    if not args:
-        return '', ''
-    if len(args) == 1:
-        a = args[0]
-        if a.startswith('http') or '.' in a:
-            return 'auto', a if a.startswith('http') else 'https://' + a
-        return a.lower(), ''
-    sub = args[0].lower()
-    url = args[1]
-    if not url.startswith('http'):
-        url = 'https://' + url
-    return sub, url
+def _parse_url_from_args(args: list) -> str:
+    """Extract URL from command args."""
+    if not args: return ""
+    for a in args:
+        if a.startswith("http") or ("." in a and "/" not in a[:a.find(".")+4]):
+            return a if a.startswith("http") else "https://" + a
+    return args[0] if args else ""
 
+def _store_url(ctx: ContextTypes.DEFAULT_TYPE, url: str) -> str:
+    """Store URL in user_data, return it."""
+    ctx.user_data["hub_url"] = url
+    return url
 
-async def _dispatch_menu(msg, cmd: str, subs: dict):
-    """Send subcommand usage menu."""
-    lines = ["📌 */" + cmd + " \\<type\\> \\<url\\>*\n"]
-    for key, (emoji, desc) in subs.items():
-        lines.append("  " + emoji + " `" + key + "` — " + desc)
-    first_key = list(subs.keys())[0]
-    lines.append("\n*Example:* `/" + cmd + " " + first_key + " https://example.com`")
-    await msg.reply_text("\n".join(lines), parse_mode='Markdown')
+def _get_url(ctx: ContextTypes.DEFAULT_TYPE) -> str:
+    return ctx.user_data.get("hub_url", "")
 
+def _safe_cb(hub: str, sub: str, url: str) -> str:
+    """Build callback_data, staying within 64-byte Telegram limit.
+    If URL is too long, store in user_data and use placeholder."""
+    data = f"hub:{hub}:{sub}:{url}"
+    if len(data.encode("utf-8")) <= 64:
+        return data
+    # URL too long — use stored URL placeholder
+    return f"hub:{hub}:{sub}:__stored__"
 
-_RECON_SUBS = {
-    'info':       ('🌐', 'Full info — IP, tech, headers, DNS'),
-    'whois':      ('📋', 'WHOIS domain registration'),
-    'subdomains': ('🔀', 'Subdomain enumeration'),
-    'ports':      ('🔌', 'Port scan (top 100 ports)'),
-    'dns':        ('🗺️', 'DNS record enumeration'),
-    'waf':        ('🛡️', 'WAF / firewall detection'),
-    'cms':        ('📦', 'CMS & technology detection'),
-    'screenshot': ('📸', 'Screenshot capture'),
-    'discover':   ('🔍', 'Auto-discover subdomains + paths'),
-    'shodan':     ('👁️', 'Shodan passive intelligence'),
-    'sitemap':    ('🗂️', 'Crawl & map all pages'),
-    'links':      ('🔗', 'Extract all links from page'),
-}
+def _url_short(url: str, n: int = 30) -> str:
+    from urllib.parse import urlparse
+    p = urlparse(url)
+    s = p.netloc + (p.path[:12] if p.path and p.path != "/" else "")
+    return s[:n] + ("…" if len(s) > n else "")
+
+# ── Button layout helpers ──────────────────────────────────────────
+
+def _make_kb(rows: list) -> InlineKeyboardMarkup:
+    """rows = [[(label, cb_data), ...], ...]"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=cb) for label, cb in row]
+        for row in rows
+    ])
+
+# ── Hub menus ─────────────────────────────────────────────────────
+
+def _recon_kb(url: str) -> InlineKeyboardMarkup:
+    u = url
+    return _make_kb([
+        [("🌐 Info",       _safe_cb("recon", "info", u)),    ("📋 WHOIS",    _safe_cb("recon", "whois", u))],
+        [("🔀 Subdomains", _safe_cb("recon", "subdomains", u)),("🔌 Ports",  _safe_cb("recon", "ports", u))],
+        [("🗺️ DNS",        _safe_cb("recon", "dns", u)),     ("🛡️ WAF",     _safe_cb("recon", "waf", u))],
+        [("📦 CMS",        _safe_cb("recon", "cms", u)),     ("📸 Screenshot",_safe_cb("recon", "screenshot", u))],
+        [("🔍 Discover",   _safe_cb("recon", "discover", u)),("👁️ Shodan",  _safe_cb("recon", "shodan", u))],
+        [("🗂️ Sitemap",    _safe_cb("recon", "sitemap", u)), ("🔗 Links",   _safe_cb("recon", "links", u))],
+    ])
+
+def _scan_kb(url: str) -> InlineKeyboardMarkup:
+    u = url
+    return _make_kb([
+        [("🔍 Full Scan",  _safe_cb("scan", "all", u)),      ("🔒 SSL",      _safe_cb("scan", "ssl", u))],
+        [("🛡️ Headers",   _safe_cb("scan", "headers", u)),   ("🌐 CORS",    _safe_cb("scan", "cors", u))],
+        [("🔑 Secrets",    _safe_cb("scan", "secrets", u)),  ("📁 Git",     _safe_cb("scan", "git", u))],
+        [("⚠️ Vuln",       _safe_cb("scan", "vuln", u)),     ("☢️ Nuclei",  _safe_cb("scan", "nuclei", u))],
+        [("⏱️ RateLimit",  _safe_cb("scan", "ratelimit", u)),("📂 Sensitive",_safe_cb("scan", "sensitive", u))],
+        [("🍪 Cookies",    _safe_cb("scan", "cookies", u)),  ("🤖 Robots",  _safe_cb("scan", "robots", u))],
+    ])
+
+def _attack_kb(url: str) -> InlineKeyboardMarkup:
+    u = url
+    return _make_kb([
+        [("🤖 AutoPwn",  _safe_cb("attack", "auto", u)),    ("🎯 Pentest",   _safe_cb("attack", "pentest", u))],
+        [("💉 SQLi",     _safe_cb("attack", "sqli", u)),    ("🕷️ XSS",      _safe_cb("attack", "xss", u))],
+        [("🔁 SSRF",     _safe_cb("attack", "ssrf", u)),    ("📁 LFI",      _safe_cb("attack", "lfi", u))],
+        [("🔐 Auth",     _safe_cb("attack", "auth", u)),    ("📄 XXE",      _safe_cb("attack", "xxe", u))],
+        [("🪙 JWT",      _safe_cb("attack", "jwt", u)),     ("🔨 Brute",    _safe_cb("attack", "brute", u))],
+        [("🚪 Bypass403",_safe_cb("attack", "bypass", u)),  ("👤 BOLA",     _safe_cb("attack", "bola", u))],
+        [("🔢 IDOR",     _safe_cb("attack", "idor", u)),    ("🔗 OAuth",    _safe_cb("attack", "oauth", u))],
+        [("📦 Smuggle",  _safe_cb("attack", "smuggle", u)), ("⬡ GraphQL",   _safe_cb("attack", "graphql", u))],
+        [("📋 MassAssign",_safe_cb("attack", "massassign", u))],
+    ])
+
+def _fuzz_kb(url: str) -> InlineKeyboardMarkup:
+    u = url
+    return _make_kb([
+        [("📁 Directory",_safe_cb("fuzz", "dir", u)),    ("🔬 Params", _safe_cb("fuzz", "params", u))],
+        [("🔌 API",      _safe_cb("fuzz", "api", u)),    ("🧠 Smart",  _safe_cb("fuzz", "smart", u))],
+        [("💥 Full Fuzz",_safe_cb("fuzz", "full", u))],
+    ])
+
+def _audit_kb(url: str) -> InlineKeyboardMarkup:
+    u = url
+    return _make_kb([
+        [("🔧 Fix Roadmap",_safe_cb("audit", "fix", u)),    ("🔎 Analyze",  _safe_cb("audit", "analyze", u))],
+        [("📝 Code Audit", _safe_cb("audit", "code", u)),   ("🔌 API Test", _safe_cb("audit", "api", u))],
+        [("🗺️ SourceMap",  _safe_cb("audit", "sourcemap", u)),("📦 Extract",_safe_cb("audit", "extract", u))],
+        [("🔑 PwdLeak",    _safe_cb("audit", "password", u)),("🖼️ Assets",  _safe_cb("audit", "assets", u))],
+        [("♻️ JS Restore", _safe_cb("audit", "jsrestore", u)),("🎯 Pentest",_safe_cb("audit", "pentest", u))],
+    ])
+
+def _report_kb() -> InlineKeyboardMarkup:
+    return _make_kb([
+        [("📜 History",   "hub:report:history:"), ("📊 My Stats",  "hub:report:stats:")],
+        [("🤖 Bot Stats", "hub:report:botstats:"),("🔍 Last Scan", "hub:report:scan:")],
+        [("💾 Export JSON","hub:report:export:")],
+    ])
+
+# ── Command entry points ──────────────────────────────────────────
 
 async def cmd_recon_unified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/recon <type> <url> — Reconnaissance hub (12 tools in 1)"""
-    sub, url = _unified_url(ctx.args or [])
-    if not sub or not url:
-        await _dispatch_menu(update.effective_message, 'recon', _RECON_SUBS)
-        return
-    ctx.args = [url]
-    dispatch = {
-        'info': cmd_info_unified, 'auto': cmd_info_unified,
-        'whois': cmd_whois, 'subdomains': cmd_subdomains,
-        'ports': cmd_port_scan, 'dns': cmd_dns_enum,
-        'waf': cmd_waf, 'cms': cmd_cms_detect,
-        'screenshot': cmd_screenshot, 'discover': cmd_discover,
-        'shodan': cmd_shodan_lite, 'sitemap': cmd_site_map, 'links': cmd_links,
-    }
-    fn = dispatch.get(sub)
-    if fn:
-        await fn(update, ctx)
-    else:
-        await _dispatch_menu(update.effective_message, 'recon', _RECON_SUBS)
-
-
-_SCAN_SUBS = {
-    'all':       ('🔍', 'Full scan — headers + ssl + cors + secrets'),
-    'ssl':       ('🔒', 'SSL/TLS certificate check'),
-    'headers':   ('🛡️', 'HTTP security headers audit'),
-    'cors':      ('🌐', 'CORS misconfiguration check'),
-    'secrets':   ('🔑', 'Secret / API key leak scan'),
-    'git':       ('📁', 'Exposed .git repo detection'),
-    'vuln':      ('⚠️', 'Passive vulnerability scan'),
-    'nuclei':    ('☢️', 'Nuclei-lite template scan'),
-    'ratelimit': ('⏱️', 'Rate limiting detection'),
-    'sensitive': ('📂', 'Sensitive file / path probe'),
-    'cookies':   ('🍪', 'Cookie security flags audit'),
-    'robots':    ('🤖', 'robots.txt analysis'),
-}
+    """/recon <url> — Reconnaissance hub"""
+    url = _parse_url_from_args(ctx.args or [])
+    if not url:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/recon <url>`\nExample: `/recon https://example.com`",
+            parse_mode="Markdown"); return
+    _store_url(ctx, url)
+    await update.effective_message.reply_text(
+        f"🕵️ *Recon — `{_url_short(url)}`*\n\nTool ရွေးပါ:",
+        parse_mode="Markdown",
+        reply_markup=_recon_kb(url))
 
 async def cmd_scan_unified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/scan <type> <url> — Passive security scan hub (11 tools in 1)"""
-    sub, url = _unified_url(ctx.args or [])
-    if not sub or not url:
-        await _dispatch_menu(update.effective_message, 'scan', _SCAN_SUBS)
-        return
-    ctx.args = [url]
-    if sub == 'all':
-        for fn in [cmd_headers, cmd_ssl_check, cmd_cors_check, cmd_secretscan]:
-            try:
-                await fn(update, ctx)
-            except Exception as _e:
-                logging.warning("scan all: %s", _e)
-        return
-    dispatch = {
-        'ssl': cmd_ssl_check, 'headers': cmd_headers, 'cors': cmd_cors_check,
-        'secrets': cmd_secretscan, 'git': cmd_gitexposed, 'vuln': cmd_vuln,
-        'nuclei': cmd_nuclei_lite, 'ratelimit': cmd_ratelimit_test,
-        'sensitive': cmd_sensitive, 'cookies': cmd_cookies, 'robots': cmd_robots,
-    }
-    fn = dispatch.get(sub)
-    if fn:
-        await fn(update, ctx)
-    else:
-        await _dispatch_menu(update.effective_message, 'scan', _SCAN_SUBS)
-
-
-_ATTACK_SUBS = {
-    'auto':       ('🤖', 'AutoPwn — full 7-phase automated pentest'),
-    'sqli':       ('💉', 'SQL injection test'),
-    'xss':        ('🕷️', 'Cross-site scripting test'),
-    'ssrf':       ('🔁', 'SSRF + open redirect test'),
-    'lfi':        ('📁', 'Local file inclusion / path traversal'),
-    'auth':       ('🔐', 'Auth weakness & default credentials'),
-    'xxe':        ('📄', 'XML External Entity injection'),
-    'jwt':        ('🪙', 'JWT attack (alg:none, RS256->HS256, brute)'),
-    'brute':      ('🔨', 'Login brute force tester'),
-    'bypass':     ('🚪', '403 Forbidden bypass (50+ techniques)'),
-    'bola':       ('👤', 'BOLA / IDOR authorization test'),
-    'idor':       ('🔢', 'UUID & resource ID enumeration'),
-    'oauth':      ('🔗', 'OAuth2 redirect URI bypass'),
-    'smuggle':    ('📦', 'HTTP request smuggling test'),
-    'graphql':    ('⬡',  'GraphQL batch / introspection attack'),
-    'massassign': ('📋', 'API mass assignment / overposting'),
-    'pentest':    ('🎯', 'Full interactive pentest suite'),
-}
+    """/scan <url> — Passive security scan hub"""
+    url = _parse_url_from_args(ctx.args or [])
+    if not url:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/scan <url>`\nExample: `/scan https://example.com`",
+            parse_mode="Markdown"); return
+    _store_url(ctx, url)
+    await update.effective_message.reply_text(
+        f"🔍 *Security Scan — `{_url_short(url)}`*\n\nScan အမျိုးအစား ရွေးပါ:",
+        parse_mode="Markdown",
+        reply_markup=_scan_kb(url))
 
 async def cmd_attack_unified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/attack <type> <url> — Active attack testing hub (17 tools in 1)"""
-    sub, url = _unified_url(ctx.args or [])
-    if not sub or not url:
-        await _dispatch_menu(update.effective_message, 'attack', _ATTACK_SUBS)
-        return
-    ctx.args = [url]
-    dispatch = {
-        'auto': cmd_autopwn, 'sqli': cmd_sqlitest, 'xss': cmd_xsstest,
-        'ssrf': cmd_ssrftest, 'lfi': cmd_lfitest, 'auth': cmd_authtest,
-        'xxe': cmd_xxe, 'jwt': cmd_jwtattack, 'brute': cmd_bruteforce,
-        'bypass': cmd_bypass403, 'bola': cmd_bola, 'idor': cmd_idor_uuid_leak,
-        'oauth': cmd_oauth_steal, 'smuggle': cmd_smuggle,
-        'graphql': cmd_graphql_batch, 'massassign': cmd_api_mass_assign,
-        'pentest': cmd_pentest,
-    }
-    fn = dispatch.get(sub)
-    if fn:
-        await fn(update, ctx)
-    else:
-        await _dispatch_menu(update.effective_message, 'attack', _ATTACK_SUBS)
-
-
-_FUZZ_SUBS = {
-    'dir':    ('📁', 'Directory & file brute-force'),
-    'params': ('🔬', 'Parameter discovery & fuzzing'),
-    'api':    ('🔌', 'API endpoint fuzzer'),
-    'smart':  ('🧠', 'Smart adaptive fuzzer'),
-    'full':   ('💥', 'Full fuzz — dir + params + api combined'),
-}
+    """/attack <url> — Active attack testing hub"""
+    url = _parse_url_from_args(ctx.args or [])
+    if not url:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/attack <url>`\nExample: `/attack https://example.com`",
+            parse_mode="Markdown"); return
+    _store_url(ctx, url)
+    await update.effective_message.reply_text(
+        f"⚔️ *Attack Test — `{_url_short(url)}`*\n\nAttack type ရွေးပါ:",
+        parse_mode="Markdown",
+        reply_markup=_attack_kb(url))
 
 async def cmd_fuzz_dispatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/fuzz <type> <url> — Fuzzing hub (5 tools in 1)"""
-    sub, url = _unified_url(ctx.args or [])
-    if not sub or not url:
-        await _dispatch_menu(update.effective_message, 'fuzz', _FUZZ_SUBS)
-        return
-    ctx.args = [url]
-    dispatch = {
-        'dir': cmd_dir_brute, 'params': cmd_paramfuzz,
-        'api': cmd_api_fuzzer, 'smart': cmd_smartfuzz,
-        'full': cmd_fuzz_unified, 'auto': cmd_fuzz_unified,
-    }
-    fn = dispatch.get(sub, cmd_fuzz_unified)
-    await fn(update, ctx)
-
-
-_AUDIT_SUBS = {
-    'code':      ('📝', 'Static code audit (uploaded file)'),
-    'api':       ('🔌', 'API endpoint structure audit'),
-    'fix':       ('🔧', 'Prioritized fix roadmap'),
-    'analyze':   ('🔎', 'Deep site analysis'),
-    'pentest':   ('🎯', 'Full pentest + fix roadmap'),
-    'sourcemap': ('🗺️', 'JS source map extraction'),
-    'extract':   ('📦', 'Asset & resource extraction'),
-    'password':  ('🔑', 'Password leak check (HIBP)'),
-    'assets':    ('🖼️', 'App assets downloader'),
-    'jsrestore': ('♻️', 'JS bundle restore from source map'),
-}
+    """/fuzz <url> — Fuzzing hub"""
+    url = _parse_url_from_args(ctx.args or [])
+    if not url:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/fuzz <url>`\nExample: `/fuzz https://example.com`",
+            parse_mode="Markdown"); return
+    _store_url(ctx, url)
+    await update.effective_message.reply_text(
+        f"🧪 *Fuzzing — `{_url_short(url)}`*\n\nFuzz type ရွေးပါ:",
+        parse_mode="Markdown",
+        reply_markup=_fuzz_kb(url))
 
 async def cmd_audit_unified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/audit <type> <url> — App & code audit hub (10 tools in 1)"""
-    sub, url = _unified_url(ctx.args or [])
-    if not sub or not url:
-        await _dispatch_menu(update.effective_message, 'audit', _AUDIT_SUBS)
-        return
-    ctx.args = [url]
-    dispatch = {
-        'code': cmd_codeaudit, 'api': cmd_apitest, 'fix': cmd_fixall,
-        'analyze': cmd_analyze, 'pentest': cmd_pentest, 'sourcemap': cmd_sourcemap,
-        'extract': cmd_extract, 'password': cmd_password_leak_check,
-        'assets': cmd_appassets, 'jsrestore': cmd_js_restore,
-    }
-    fn = dispatch.get(sub, cmd_audit)
-    await fn(update, ctx)
-
-
-_REPORT_SUBS = {
-    'history':  ('📜', 'My scan history'),
-    'stats':    ('📊', 'My personal stats'),
-    'botstats': ('🤖', 'Bot-wide statistics (admin)'),
-    'scan':     ('🔍', 'Last scan result'),
-    'export':   ('💾', 'Export last report as JSON'),
-}
+    """/audit <url> — App & code audit hub"""
+    url = _parse_url_from_args(ctx.args or [])
+    if not url:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/audit <url>`\nExample: `/audit https://example.com`",
+            parse_mode="Markdown"); return
+    _store_url(ctx, url)
+    await update.effective_message.reply_text(
+        f"🛡️ *Audit — `{_url_short(url)}`*\n\nAudit type ရွေးပါ:",
+        parse_mode="Markdown",
+        reply_markup=_audit_kb(url))
 
 async def cmd_report_unified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/report [type] — Reports & stats hub"""
-    args = ctx.args or []
-    sub  = args[0].lower() if args else 'history'
-    dispatch = {
-        'history': cmd_history, 'stats': cmd_mystats,
-        'botstats': cmd_botstats, 'scan': cmd_scan_history, 'export': cmd_report,
-    }
-    fn = dispatch.get(sub)
-    if fn:
-        await fn(update, ctx)
+    """/report — Reports & stats hub"""
+    await update.effective_message.reply_text(
+        "📊 *Reports*\n\nကြည့်ချင်တာ ရွေးပါ:",
+        parse_mode="Markdown",
+        reply_markup=_report_kb())
+
+# ── Hub callback router ───────────────────────────────────────────
+
+async def hub_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle all hub:* button callbacks."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # format: hub:<hub>:<sub>:<url>
+
+    if not data.startswith("hub:"): return
+    parts = data.split(":", 3)
+    if len(parts) < 3: return
+
+    _, hub, sub = parts[0], parts[1], parts[2]
+    url = parts[3] if len(parts) > 3 else ""
+    if url == "__stored__" or not url:
+        url = _get_url(ctx)
+    elif url:
+        _store_url(ctx, url)
+
+    if not url and hub != "report":
+        await query.message.reply_text("❌ URL မရှိပါ — `/attack https://example.com` ထပ်ရိုက်ပါ",
+                                       parse_mode="Markdown"); return
+
+    # Set ctx.args so existing functions work unchanged
+    ctx.args = [url] if url else []
+
+    # ── Dispatch ──────────────────────────────────────────────────
+    if hub == "recon":
+        d = {"info": cmd_info_unified, "whois": cmd_whois,
+             "subdomains": cmd_subdomains, "ports": cmd_port_scan,
+             "dns": cmd_dns_enum, "waf": cmd_waf, "cms": cmd_cms_detect,
+             "screenshot": cmd_screenshot, "discover": cmd_discover,
+             "shodan": cmd_shodan_lite, "sitemap": cmd_site_map, "links": cmd_links}
+    elif hub == "scan":
+        if sub == "all":
+            await query.message.reply_text(f"🔍 Running full scan on `{_url_short(url)}`...",
+                                           parse_mode="Markdown")
+            for fn in [cmd_headers, cmd_ssl_check, cmd_cors_check, cmd_secretscan]:
+                try: await fn(update, ctx)
+                except Exception as e: logging.warning("scan all: %s", e)
+            return
+        d = {"ssl": cmd_ssl_check, "headers": cmd_headers, "cors": cmd_cors_check,
+             "secrets": cmd_secretscan, "git": cmd_gitexposed, "vuln": cmd_vuln,
+             "nuclei": cmd_nuclei_lite, "ratelimit": cmd_ratelimit_test,
+             "sensitive": cmd_sensitive, "cookies": cmd_cookies, "robots": cmd_robots}
+    elif hub == "attack":
+        d = {"auto": cmd_autopwn, "sqli": cmd_sqlitest, "xss": cmd_xsstest,
+             "ssrf": cmd_ssrftest, "lfi": cmd_lfitest, "auth": cmd_authtest,
+             "xxe": cmd_xxe, "jwt": cmd_jwtattack, "brute": cmd_bruteforce,
+             "bypass": cmd_bypass403, "bola": cmd_bola, "idor": cmd_idor_uuid_leak,
+             "oauth": cmd_oauth_steal, "smuggle": cmd_smuggle,
+             "graphql": cmd_graphql_batch, "massassign": cmd_api_mass_assign,
+             "pentest": cmd_pentest}
+    elif hub == "fuzz":
+        d = {"dir": cmd_dir_brute, "params": cmd_paramfuzz,
+             "api": cmd_api_fuzzer, "smart": cmd_smartfuzz, "full": cmd_fuzz_unified}
+    elif hub == "audit":
+        d = {"fix": cmd_fixall, "analyze": cmd_analyze, "code": cmd_codeaudit,
+             "api": cmd_apitest, "sourcemap": cmd_sourcemap, "extract": cmd_extract,
+             "password": cmd_password_leak_check, "assets": cmd_appassets,
+             "jsrestore": cmd_js_restore, "pentest": cmd_pentest}
+    elif hub == "report":
+        d = {"history": cmd_history, "stats": cmd_mystats_v2,
+             "botstats": cmd_botstats, "scan": cmd_scan_history, "export": cmd_report}
     else:
-        await _dispatch_menu(update.effective_message, 'report', _REPORT_SUBS)
+        return
+
+    fn = d.get(sub)
+    if fn:
+        try:
+            await fn(update, ctx)
+        except Exception as e:
+            logger.error("hub_callback %s:%s error: %s", hub, sub, e)
+            await query.message.reply_text(f"❌ Error: `{type(e).__name__}: {str(e)[:100]}`",
+                                           parse_mode="Markdown")
+    else:
+        await query.message.reply_text(f"❌ Unknown: `{hub}:{sub}`", parse_mode="Markdown")
 
 
 _ADMIN_SUBS = {
