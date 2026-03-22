@@ -1,1 +1,1 @@
-worker: python arch/main_patch.py
+worker: python bot_v52_finals.py
