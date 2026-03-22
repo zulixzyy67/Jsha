@@ -27653,14 +27653,20 @@ async def _call_claude_fix(vuln_report: str, url: str) -> str:
                     "content-type": "application/json",
                 },
                 json={
-                    "model": "claude-sonnet-4-6",
+                    "model": "claude-sonnet-4-5",
                     "max_tokens": 2000,
                     "messages": [{"role": "user", "content": prompt}]
                 },
                 timeout=_aio.ClientTimeout(total=45)
             ) as r:
                 if r.status != 200:
-                    return f"❌ Claude API error: HTTP {r.status}"
+                    try:
+                        err_body = await r.json()
+                        err_msg = err_body.get("error", {}).get("message", str(err_body))[:120]
+                    except Exception:
+                        err_msg = await r.text()
+                        err_msg = err_msg[:120]
+                    return f"❌ Claude API error: HTTP {r.status}\n`{err_msg}`"
                 data = await r.json()
                 return data["content"][0]["text"]
     except Exception as e:
@@ -27713,34 +27719,68 @@ async def cmd_fix_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         findings = []
         ctx.args  = [url]
 
-        async def _collect(fn, label):
+        # ── Direct lightweight security checks (no monkey-patching) ──
+        async def _hdr_check(u: str) -> str:
             try:
-                # Capture output by monkey-patching reply_text temporarily
-                captured = []
-                orig_reply = update.effective_message.reply_text
-                async def _cap(text, **kw):
-                    captured.append(text)
-                    return type("M", (), {"edit_text": lambda *a,**k: None,
-                                          "message_id": 0})()
-                update.effective_message.reply_text = _cap
-                _rl_bypass_users.add(uid)
-                await fn(update, ctx)
-                _rl_bypass_users.discard(uid)
-                update.effective_message.reply_text = orig_reply
-                if captured:
-                    findings.append(f"=== {label} ===\n" + "\n".join(str(c)[:500] for c in captured[:2]))
+                conn = aiohttp.TCPConnector(ssl=False)
+                async with aiohttp.ClientSession(connector=conn, headers=_get_headers(),
+                        timeout=aiohttp.ClientTimeout(total=15)) as sess:
+                    async with sess.get(u, allow_redirects=True) as r:
+                        hdrs = {k.lower(): v for k, v in r.headers.items()}
+                        status = r.status
+                SEC = ["strict-transport-security","content-security-policy",
+                       "x-frame-options","x-content-type-options","referrer-policy"]
+                missing = [h for h in SEC if h not in hdrs]
+                leaky   = {k: hdrs[k][:50] for k in ["server","x-powered-by"] if k in hdrs}
+                cookie  = hdrs.get("set-cookie","")
+                c_issues = [f for f in ["httponly","secure","samesite"] if f not in cookie.lower()] if cookie else []
+                https_ok = u.startswith("https://")
+                parts = [f"Status: {status}", f"HTTPS: {'Yes' if https_ok else 'NO - plain HTTP!'}"]
+                if missing:  parts.append(f"Missing headers: {', '.join(missing)}")
+                if leaky:    parts.append(f"Info exposed: {leaky}")
+                if c_issues: parts.append(f"Cookie flags missing: {', '.join(c_issues)}")
+                cors = hdrs.get("access-control-allow-origin","")
+                if cors: parts.append(f"CORS Allow-Origin: {cors}")
+                return "\n".join(parts)
             except Exception as e:
-                findings.append(f"=== {label} ===\nError: {e}")
+                return f"Headers check error: {e}"
 
-        await asyncio.gather(
-            _collect(cmd_headers,    "HTTP Security Headers"),
-            _collect(cmd_ssl_check,  "SSL/TLS"),
-            _collect(cmd_cors_check, "CORS"),
-            _collect(cmd_secretscan, "Secrets/API Keys"),
-            return_exceptions=True
+        async def _ssl_chk(host: str, u: str) -> str:
+            if u.startswith("http://"):
+                return "SSL: Site uses HTTP only — no TLS certificate"
+            try:
+                import ssl as _ssl
+                ctx = _ssl.create_default_context()
+                def _g():
+                    with socket.create_connection((host, 443), timeout=8) as s:
+                        with ctx.wrap_socket(s, server_hostname=host) as ss:
+                            return ss.getpeercert()
+                cert  = await asyncio.to_thread(_g)
+                exp   = datetime.strptime(cert.get("notAfter",""), "%b %d %H:%M:%S %Y %Z")
+                days  = (exp - datetime.utcnow()).days
+                issr  = dict(x[0] for x in cert.get("issuer",[]))
+                return f"SSL valid, expires in {days} days, issuer: {issr.get('organizationName','?')}"
+            except _ssl.SSLCertVerificationError as e:
+                return f"SSL INVALID: {e}"
+            except Exception as e:
+                return f"SSL check failed: {e}"
+
+        _rl_bypass_users.add(uid)
+        host = urlparse(url).hostname or ""
+        h_res, s_res = await asyncio.gather(
+            _hdr_check(url), _ssl_chk(host, url),
+            return_exceptions=True)
+        _rl_bypass_users.discard(uid)
+
+        vuln_text = (
+            f"=== HTTP Security Headers & CORS ===\n{h_res}\n\n"
+            f"=== SSL/TLS ===\n{s_res}"
         )
-
-        vuln_text = "\n\n".join(findings) if findings else "No findings captured."
+        if not str(h_res).strip():
+            await msg.edit_text(
+                f"⚠️ *Scan မအောင်မြင်ပါ* — `{domain}` ကို access မရပါ",
+                parse_mode="Markdown")
+            return
 
         await msg.edit_text(
             f"🔧 *AI Fix Generator — `{domain}`*\n\n"
