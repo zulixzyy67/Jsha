@@ -24474,7 +24474,7 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.effective_message.reply_text(
         f"🌐 *Domain Info — `{domain}`*\n\n⏳ Fetching WHOIS + DNS...", parse_mode='Markdown')
 
-    def _do():
+    async def _do():
         info = {}
         # IP
         try: info['ip'] = socket.gethostbyname(domain)
@@ -24532,7 +24532,7 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return info
 
-    data = await asyncio.to_thread(_do)
+    data = await _do()
     lines = [f"🌐 *Domain Info — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━━━", ""]
 
     # IPs
