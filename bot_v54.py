@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  Website Downloader Bot  v58.0  — Admin Fix + New Scan Engines    ║
 # ║  ✅ Thread Safety + Memory Monitor + Per-User Quotas        ║
@@ -20038,7 +20039,6 @@ cmd_subdomain_enum = cmd_subdomains
 #     ⑤ JSON Output     — CI/CD exit-code 0/1, machine-parseable
 # ══════════════════════════════════════════════════════════════════════════════
 
-from __future__ import annotations
 import io as _io_sec
 
 class _Severity(int):
