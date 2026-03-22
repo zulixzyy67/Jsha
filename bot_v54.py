@@ -147,6 +147,55 @@ def get_user_limits(uid: int) -> dict:
     return VIP_LIMITS if (uid in ADMIN_IDS or is_vip(uid)) else FREE_LIMITS
 
 
+# ══════════════════════════════════════════════════
+# 🛡️  MARKDOWN SAFE HELPERS  — v54
+# ══════════════════════════════════════════════════
+
+def md_escape(text: str) -> str:
+    """Escape special chars for Markdown (not MarkdownV2)."""
+    # In PTB Markdown mode: * _ ` [ ] ( ) ~ > # + - = | { } . ! need escaping
+    # But we only escape the ones that break parsing most often
+    for ch in ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']:
+        text = text.replace(ch, '\\' + ch)
+    return text
+
+async def safe_reply(msg_obj, text: str, parse_mode: str = 'Markdown',
+                     reply_markup=None, disable_web_page_preview: bool = True, **kw):
+    """reply_text with automatic fallback if Markdown parse fails."""
+    try:
+        return await msg_obj.reply_text(
+            text, parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            disable_web_page_preview=disable_web_page_preview, **kw)
+    except Exception as e:
+        if 'parse' in str(e).lower() or 'entity' in str(e).lower() or 'BadRequest' in str(e):
+            # Strip all markdown and retry
+            plain = text.replace('*','').replace('_','').replace('`','').replace('[','').replace(']','')
+            try:
+                return await msg_obj.reply_text(
+                    plain[:4096], reply_markup=reply_markup,
+                    disable_web_page_preview=disable_web_page_preview)
+            except Exception:
+                pass
+        raise
+
+async def safe_edit(msg_obj, text: str, parse_mode: str = 'Markdown',
+                    reply_markup=None, **kw):
+    """edit_text with automatic fallback if Markdown parse fails."""
+    try:
+        return await msg_obj.edit_text(
+            text, parse_mode=parse_mode,
+            reply_markup=reply_markup, **kw)
+    except Exception as e:
+        if 'parse' in str(e).lower() or 'entity' in str(e).lower() or 'BadRequest' in str(e):
+            plain = text.replace('*','').replace('_','').replace('`','').replace('[','').replace(']','')
+            try:
+                return await msg_obj.edit_text(plain[:4096], reply_markup=reply_markup)
+            except Exception:
+                pass
+        raise
+
+
 # ── DATA_DIR: persistent storage root ──────────────────────────────────
 # Railway: mount a volume at /app/data for persistence across deploys
 # Without a volume, /app/data is ephemeral (wiped on redeploy) — still works fine
@@ -197,7 +246,7 @@ DAILY_LIMIT           = int(os.getenv("DAILY_LIMIT", "10"))   # downloads per us
 MAX_WORKERS           = 16    # Parallel extraction workers
 MAX_PAGES             = 1000  # Deep crawling page limit
 MAX_ASSETS            = 10000 # Large site asset limit
-TIMEOUT               = int(os.getenv("TIMEOUT", "60"))       # increased for heavy data processing
+TIMEOUT               = int(os.getenv("TIMEOUT", "90"))       # v54: increased for slow sites
 TIMEOUT_WARN          = int(os.getenv("TIMEOUT_WARN", "50"))
 SPLIT_MB              = 45
 MAX_ASSET_MB          = 500   # Support larger asset downloads
@@ -1346,6 +1395,7 @@ _pentest_daily_lock = threading.Lock()
 # {uid: {cmd_type: (count, date_str)}}
 _daily_quotas: dict = {}
 _daily_quota_lock = threading.Lock()
+_rl_bypass_users: set = set()  # Users temporarily bypassing heavy rate limit (full scan)
 
 # Daily limits per command type (overrideable via env)
 DAILY_LIMITS = {
@@ -1422,7 +1472,7 @@ def check_scan_rate(user_id: int) -> tuple:
     return check_rate_limit(user_id, heavy=True)
 
 
-def check_rate_limit(user_id: int, heavy: bool = False) -> tuple:
+def check_rate_limit(user_id: int, heavy: bool = False, bypass: bool = False) -> tuple:
     """
     Token Bucket rate limiter.
     Returns: (allowed: bool, wait_seconds: int)
@@ -2494,7 +2544,7 @@ def _fetch_page_sync(url: str, use_js: bool = False) -> tuple:
         return sess.get(
             url,
             headers=hdrs,
-            timeout=(8, TIMEOUT),   # (connect_timeout, read_timeout)
+            timeout=(15, TIMEOUT + 30),  # v54: connect=15s, read=120s for slow sites
             allow_redirects=True,
         )
 
@@ -12310,7 +12360,7 @@ async def _run_download(
             err_detail = str(e)[:80] if err_name == "NameError" else ""
             err_hint = {
                 "ConnectionError":  "🌐 ဆာဗာနဲ့ ချိတ်ဆက်မရပါ",
-                "TimeoutError":     "⏱️ Response timeout ဖြစ်သွားတယ်",
+                "TimeoutError":     "⏱️ Response timeout ဖြစ်သွားတယ် — site တုံ့ပြန်နှေးနိုင်တယ်",
                 "SSLError":         "🔒 SSL certificate ပြဿနာ",
                 "TooManyRedirects": "🔄 Redirect loop ဖြစ်နေတယ်",
             }.get(err_name, f"⚠️ {err_name}" + (f": `{err_detail}`" if err_detail else ""))
@@ -19860,6 +19910,7 @@ def main():
 
     app.add_handler(CH("cancel",  cmd_cancel))
     app.add_handler(CH("vip",     cmd_vip))
+    app.add_handler(CH("fix",     cmd_fix_ai))   # AI fix generator
     app.add_handler(CallbackQueryHandler(vip_callback, pattern="^vip_"))
     app.add_handler(CallbackQueryHandler(hub_callback, pattern="^hub:"))
 
@@ -19927,6 +19978,8 @@ def main():
             BotCommand("audit",  "🛡️ Audit (code/fix/analyze/sourcemap...)"),
             BotCommand("report", "📊 Stats & history"),
             BotCommand("vip",    "💎 VIP Plans & upgrade"),
+            BotCommand("fix",    "🔧 AI fix guide — scan + auto fix code"),
+
         ]
 
         # ── Admin commands ───────────────────────────────────────────────
@@ -27408,11 +27461,26 @@ async def hub_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
              "shodan": cmd_shodan_lite, "sitemap": cmd_site_map, "links": cmd_links}
     elif hub == "scan":
         if sub == "all":
-            await query.message.reply_text(f"🔍 Running full scan on `{_url_short(url)}`...",
-                                           parse_mode="Markdown")
-            for fn in [cmd_headers, cmd_ssl_check, cmd_cors_check, cmd_secretscan]:
-                try: await fn(update, ctx)
-                except Exception as e: logging.warning("scan all: %s", e)
+            uid_cb = update.effective_user.id
+            await query.message.reply_text(
+                f"🔍 *Running full scan on* `{_url_short(url)}`...\n"
+                "Headers · SSL · CORS · Secrets — parallel",
+                parse_mode="Markdown")
+            # Bypass heavy rate limit for sub-scans so they don't block each other
+            _rl_bypass_users.add(uid_cb)
+            async def _run_scan(fn):
+                try:
+                    await fn(update, ctx)
+                except Exception as e:
+                    logging.warning("scan all %s: %s", fn.__name__, e)
+            await asyncio.gather(
+                _run_scan(cmd_headers),
+                _run_scan(cmd_ssl_check),
+                _run_scan(cmd_cors_check),
+                _run_scan(cmd_secretscan),
+                return_exceptions=True
+            )
+            _rl_bypass_users.discard(uid_cb)
             return
         d = {"ssl": cmd_ssl_check, "headers": cmd_headers, "cors": cmd_cors_check,
              "secrets": cmd_secretscan, "git": cmd_gitexposed, "vuln": cmd_vuln,
@@ -27445,11 +27513,38 @@ async def hub_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await fn(update, ctx)
         except Exception as e:
-            logger.error("hub_callback %s:%s error: %s", hub, sub, e)
-            await query.message.reply_text(f"❌ Error: `{type(e).__name__}: {str(e)[:100]}`",
-                                           parse_mode="Markdown")
+            err_str = str(e)
+            if 'parse' in err_str.lower() or 'entity' in err_str.lower():
+                # Markdown parse error — silently ignore, result already sent as plain
+                logger.debug("hub_callback markdown error %s:%s: %s", hub, sub, e)
+            else:
+                logger.error("hub_callback %s:%s error: %s", hub, sub, e)
+                try:
+                    await query.message.reply_text(
+                        f"❌ {hub}/{sub} error: {type(e).__name__}: {err_str[:80]}",
+                        disable_web_page_preview=True)
+                except Exception:
+                    pass
     else:
-        await query.message.reply_text(f"❌ Unknown: `{hub}:{sub}`", parse_mode="Markdown")
+        try:
+            await query.message.reply_text(f"❌ Unknown: {hub}:{sub}")
+        except Exception:
+            pass
+
+
+async def _dispatch_menu(msg, cmd: str, subs: dict):
+    """Send subcommand usage menu as inline keyboard."""
+    lines = ["📌 */" + cmd + "* — subcommand ရွေးပါ\n"]
+    for key, (emoji, desc) in subs.items():
+        lines.append(emoji + " `" + key + "` — " + desc)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(emoji + " " + key, callback_data="adm_sub_" + cmd + "_" + key)]
+        for key, (emoji, desc) in list(subs.items())
+    ])
+    try:
+        await msg.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb)
+    except Exception:
+        await msg.reply_text("\n".join(lines))
 
 
 _ADMIN_SUBS = {
@@ -27520,6 +27615,191 @@ async def cmd_admin_unified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await fn(update, ctx)
     else:
         await _dispatch_menu(update.effective_message, 'admin', _ADMIN_SUBS)
+
+# ══════════════════════════════════════════════════════════════════
+# 🔧  /fix <url>  — AI-powered vulnerability fix generator
+#     URL scan → vulnerability findings → Claude API →
+#     step-by-step fix guide + code snippets
+# ══════════════════════════════════════════════════════════════════
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+async def _call_claude_fix(vuln_report: str, url: str) -> str:
+    """Call Claude API to generate fix guide from scan results."""
+    if not ANTHROPIC_API_KEY:
+        return "❌ ANTHROPIC_API_KEY environment variable မသတ်မှတ်ရသေးပါ။"
+    import aiohttp as _aio
+    prompt = (
+        f"You are a security expert helping a developer fix vulnerabilities.\n"
+        f"Website: {url}\n\n"
+        f"Scan findings:\n{vuln_report}\n\n"
+        f"For each vulnerability found:\n"
+        f"1. Explain what it is (1-2 sentences in simple terms)\n"
+        f"2. Show the fix with actual code snippet (Python/JS/Nginx/Apache config as appropriate)\n"
+        f"3. Priority: Critical/High/Medium\n\n"
+        f"Format each fix as:\n"
+        f"**[Priority] Vulnerability Name**\n"
+        f"Problem: ...\n"
+        f"Fix:\n```language\ncode here\n```\n\n"
+        f"Be concise. Focus on actionable fixes. Use Myanmar language for explanations, English for code."
+    )
+    try:
+        async with _aio.ClientSession() as sess:
+            async with sess.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 2000,
+                    "messages": [{"role": "user", "content": prompt}]
+                },
+                timeout=_aio.ClientTimeout(total=45)
+            ) as r:
+                if r.status != 200:
+                    return f"❌ Claude API error: HTTP {r.status}"
+                data = await r.json()
+                return data["content"][0]["text"]
+    except Exception as e:
+        return f"❌ Claude API failed: {type(e).__name__}: {str(e)[:80]}"
+
+
+async def cmd_fix_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/fix <url> — AI-powered vulnerability scan + fix guide generator"""
+    if not await check_force_join(update, ctx): return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid, heavy=True)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode="Markdown")
+        return
+    if uid in _active_scans:
+        await update.effective_message.reply_text(
+            f"⏳ `{_active_scans.get(uid)}` running — `/stop` နှိပ်ပါ",
+            parse_mode="Markdown"); return
+
+    args = ctx.args or []
+    if not args:
+        await update.effective_message.reply_text(
+            "🔧 *AI Fix Generator*\n\n"
+            "`/fix <url>`\n\n"
+            "ဘာလုပ်ပေးသလဲ:\n"
+            "  1️⃣ URL ကို security scan လုပ်တယ်\n"
+            "  2️⃣ Vulnerability တွေ ဖော်ထုတ်တယ်\n"
+            "  3️⃣ Claude AI နဲ့ fix code + explanation ထုတ်ပေးတယ်\n\n"
+            "*Example:* `/fix https://example.com`\n\n"
+            "⚠️ _ANTHROPIC API KEY environment variable လိုအပ်တယ်_",
+            parse_mode="Markdown"); return
+
+    url = args[0].strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode="Markdown"); return
+
+    domain = urlparse(url).netloc
+    _active_scans.set(uid, "AI Fix")
+    msg = await update.effective_message.reply_text(
+        f"🔧 *AI Fix Generator — `{domain}`*\n\n"
+        f"⏳ Step 1/3: Security scan လုပ်နေပါတယ်...\n"
+        f"_(Headers · SSL · CORS · Secrets)_",
+        parse_mode="Markdown")
+
+    try:
+        # ── Step 1: Run passive scans in parallel ──────────────
+        findings = []
+        ctx.args  = [url]
+
+        async def _collect(fn, label):
+            try:
+                # Capture output by monkey-patching reply_text temporarily
+                captured = []
+                orig_reply = update.effective_message.reply_text
+                async def _cap(text, **kw):
+                    captured.append(text)
+                    return type("M", (), {"edit_text": lambda *a,**k: None,
+                                          "message_id": 0})()
+                update.effective_message.reply_text = _cap
+                _rl_bypass_users.add(uid)
+                await fn(update, ctx)
+                _rl_bypass_users.discard(uid)
+                update.effective_message.reply_text = orig_reply
+                if captured:
+                    findings.append(f"=== {label} ===\n" + "\n".join(str(c)[:500] for c in captured[:2]))
+            except Exception as e:
+                findings.append(f"=== {label} ===\nError: {e}")
+
+        await asyncio.gather(
+            _collect(cmd_headers,    "HTTP Security Headers"),
+            _collect(cmd_ssl_check,  "SSL/TLS"),
+            _collect(cmd_cors_check, "CORS"),
+            _collect(cmd_secretscan, "Secrets/API Keys"),
+            return_exceptions=True
+        )
+
+        vuln_text = "\n\n".join(findings) if findings else "No findings captured."
+
+        await msg.edit_text(
+            f"🔧 *AI Fix Generator — `{domain}`*\n\n"
+            f"✅ Step 1/3: Scan ပြီးပြီ\n"
+            f"⏳ Step 2/3: Claude AI ကို findings ပို့နေပါတယ်...",
+            parse_mode="Markdown")
+
+        # ── Step 2: Send to Claude API ─────────────────────────
+        fix_guide = await _call_claude_fix(vuln_text, url)
+
+        await msg.edit_text(
+            f"🔧 *AI Fix Generator — `{domain}`*\n\n"
+            f"✅ Scan + AI analysis ပြီးပြီ\n"
+            f"⏳ Step 3/3: Fix guide ပြသနေပါတယ်...",
+            parse_mode="Markdown")
+
+        # ── Step 3: Send fix guide (split if long) ─────────────
+        header = f"🔧 *AI Fix Guide — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        full   = header + fix_guide
+
+        if len(full) <= 4096:
+            try:
+                await update.effective_message.reply_text(full, parse_mode="Markdown",
+                    disable_web_page_preview=True)
+            except Exception:
+                await update.effective_message.reply_text(
+                    full.replace("*","").replace("`","").replace("_","")[:4096])
+        else:
+            # Split into chunks
+            chunks = []
+            current = header
+            for line in fix_guide.splitlines():
+                if len(current) + len(line) + 1 > 3800:
+                    chunks.append(current)
+                    current = line + "\n"
+                else:
+                    current += line + "\n"
+            if current.strip():
+                chunks.append(current)
+            for chunk in chunks:
+                try:
+                    await update.effective_message.reply_text(
+                        chunk, parse_mode="Markdown", disable_web_page_preview=True)
+                except Exception:
+                    await update.effective_message.reply_text(
+                        chunk.replace("*","").replace("`","").replace("_","")[:4096])
+
+        # Delete loading message
+        try: await msg.delete()
+        except Exception: pass
+
+    except Exception as e:
+        logger.error("cmd_fix_ai error: %s", e)
+        await msg.edit_text(f"❌ Fix generation failed: `{type(e).__name__}: {str(e)[:80]}`",
+                            parse_mode="Markdown")
+    finally:
+        _active_scans.pop(uid, None)
+        _rl_bypass_users.discard(uid)
+
 
 if __name__ == '__main__':
     main()
