@@ -5903,16 +5903,21 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "သို့မဟုတ် `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "Vuln scan")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "VulnScan", url if context.args else "")))
     allowed, wait_sec = check_rate_limit(uid)
     if not allowed:
         await update.effective_message.reply_text(
             f"⏱️ `{wait_sec}` seconds စောင့်ပါ",
-            parse_mode='Markdown'); return
+            parse_mode='Markdown')
+        _active_scans.pop(uid, None)
+        return
 
     safe_ok, reason = is_safe_url(url)
     if not safe_ok:
         await update.effective_message.reply_text(
-            f"🚫 `{reason}`", parse_mode='Markdown'); return
+            f"🚫 `{reason}`", parse_mode='Markdown')
+        _active_scans.pop(uid, None)
+        return
 
     domain = urlparse(url).netloc
     msg = await update.effective_message.reply_text(
@@ -7110,6 +7115,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"သို့မဟုတ် `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "TechStack")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "TechScan", url if context.args else "")))
 
     url = context.args[0].strip()
     if not url.startswith('http'):
@@ -7118,6 +7124,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
     safe_ok, reason = is_safe_url(url)
     if not safe_ok:
         await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        _active_scans.pop(uid, None)
         return
 
     msg = await update.effective_message.reply_text("🔬 Tech stack fingerprinting...")
@@ -7178,6 +7185,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         detected, notable, status, profile = await _do_tech_scan()
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
+        _active_scans.pop(uid, None)
         return
 
     domain = urlparse(url).hostname
@@ -7263,7 +7271,7 @@ async def monitor_loop():
                         entry["last_check"] = now
 
                         if old_hash and old_hash != new_hash:
-                            changed_alerts.append((uid_str, entry, new_hash, resp.status_code))
+                            changed_alerts.append((uid_str, entry, new_hash, _mr.status))
                         entry["last_hash"] = new_hash
                     except Exception as ex:
                         logger.debug("Monitor check error %s: %s", entry.get("url"), ex)
@@ -8081,9 +8089,11 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "သို့မဟုတ် `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "403 Bypass")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "Bypass403", url if context.args else "")))
     allowed, wait = check_rate_limit(uid)
     if not allowed:
         await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        _active_scans.pop(uid, None)
         return
 
     url = context.args[0].strip()
@@ -8093,6 +8103,8 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
     safe_ok, reason = is_safe_url(url)
     if not safe_ok:
         await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        _active_scans.pop(uid, None)
+        _active_scans.pop(uid, None)
         return
 
     domain = urlparse(url).hostname
@@ -8109,6 +8121,7 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = await asyncio.to_thread(_bypass_sync, url)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
+        _active_scans.pop(uid, None)
         return
 
     baseline    = next((r for r in results if r.get("technique") == "Baseline"), None)
@@ -8683,11 +8696,13 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "သို့မဟုတ် `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "Subdomain scan")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "Subdomains", url if context.args else "")))
     # Skip rate limit if called internally from /discover
     if not context.user_data.get('_discover_internal'):
         allowed, wait = check_rate_limit(uid)
         if not allowed:
             await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+            _active_scans.pop(uid, None)
             return
 
     raw = context.args[0].strip().replace("https://","").replace("http://","").split("/")[0].lower()
@@ -8695,6 +8710,7 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Basic domain validation
     if not re.match(r'^[a-z0-9][a-z0-9\-.]+\.[a-z]{2,}$', raw):
         await update.effective_message.reply_text("❌ Invalid domain format. Example: `example.com`", parse_mode='Markdown')
+        _active_scans.pop(uid, None)
         return
 
     # SSRF: block private IPs for the apex domain
@@ -8702,6 +8718,7 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
         apex_ip = socket.gethostbyname(raw)
         if not _is_safe_ip(apex_ip):
             await update.effective_message.reply_text(f"🚫 Private IP blocked: `{apex_ip}`", parse_mode='Markdown')
+            _active_scans.pop(uid, None)
             return
     except socket.gaierror:
         pass  # domain may not have A record — still continue
@@ -8736,6 +8753,7 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
+        _active_scans.pop(uid, None)
         return
     finally:
         _active_scans.pop(uid, None)
@@ -9223,6 +9241,7 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "သို့မဟုတ် `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "Fuzzing")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "DirFuzz", url if context.args else "")))
     if not context.args:
         await update.effective_message.reply_text(
             "📌 *Usage:*\n"
@@ -9242,12 +9261,14 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ _Authorized testing only._",
             parse_mode='Markdown'
         )
+        _active_scans.pop(uid, None)
         return
 
     uid = update.effective_user.id
     allowed, wait = check_rate_limit(uid)
     if not allowed:
         await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        _active_scans.pop(uid, None)
         return
 
     url = context.args[0].strip()
@@ -9258,6 +9279,7 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     safe_ok, reason = is_safe_url(url)
     if not safe_ok:
         await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        _active_scans.pop(uid, None)
         return
 
     domain   = urlparse(url).hostname
@@ -9295,6 +9317,7 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
+        _active_scans.pop(uid, None)
         return
     finally:
         _active_scans.pop(uid, None)
@@ -12928,6 +12951,7 @@ async def cmd_headers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "သို့မဟုတ် `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "Headers")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "HeadersScan", url if context.args else "")))
     if not url.startswith('http'):
         url = 'https://' + url
 
@@ -13019,6 +13043,7 @@ async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "သို့မဟုတ် `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "Links")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "LinksScan", url if context.args else "")))
     if not url.startswith('http'):
         url = 'https://' + url
 
@@ -14603,6 +14628,7 @@ async def cmd_discover(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     _active_scans.set(uid, "Discover")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "Discover", url if context.args else "")))
 
     args = context.args or []
     url  = args[0].strip() if args else ""
@@ -14623,6 +14649,7 @@ async def cmd_discover(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "*Example:* `/discover https://example.com`",
             parse_mode='Markdown'
         )
+        _active_scans.pop(uid, None)
         return
 
     if not url.startswith('http'):
@@ -15291,6 +15318,7 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     _active_scans.set(uid, "Source Analyze")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "Analyze", url if context.args else "")))
 
     msg = await update.effective_message.reply_text(
         f"🔬 *Analyzing* `{domain}`...\n\n"
@@ -15309,6 +15337,7 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Analyze error: `{type(e).__name__}: {str(e)[:100]}`",
             parse_mode='Markdown'
         )
+        _active_scans.pop(uid, None)
         return
     finally:
         _active_scans.pop(uid, None)  # Always unlock after scan
@@ -15653,6 +15682,7 @@ async def cmd_apitest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     _active_scans.set(uid, "API Token Test")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "APITest", url if context.args else "")))
     domain = urlparse(url).netloc
     msg    = await update.effective_message.reply_text(
         f"🔐 *API Token Test — `{domain}`*\n\nStep 1/3: Auth endpoints probe...\n⏳",
@@ -15681,6 +15711,7 @@ async def cmd_apitest(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`",
             parse_mode='Markdown'
         )
+        _active_scans.pop(uid, None)
         return
     finally:
         _active_scans.pop(uid, None)
@@ -16245,6 +16276,7 @@ async def cmd_codeaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     _active_scans.set(uid, "Code Audit")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "CodeAudit", url if context.args else "")))
 
     msg = await update.effective_message.reply_text(
         f"🔍 *Code Audit — `{domain}`*\n\n"
@@ -16263,6 +16295,7 @@ async def cmd_codeaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Audit error: `{type(e).__name__}: {str(e)[:100]}`",
             parse_mode='Markdown'
         )
+        _active_scans.pop(uid, None)
         return
     finally:
         _active_scans.pop(uid, None)
@@ -17501,6 +17534,7 @@ async def cmd_pentest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     domain = urlparse(url).netloc
     _active_scans.set(uid, "Pentest")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "Pentest", url if context.args else "")))
 
     msg = await update.effective_message.reply_text(
         f"⚔️ *Full Pentest — `{domain}`*\n\n"
@@ -19252,6 +19286,12 @@ async def _startup_pools(application=None):
     except Exception as e:
         logger.warning("aiosqlite pool startup failed: %s", e)
 
+# ── Backward-compat aliases (must be defined before main()) ──────────────
+cmd_tech_stack    = cmd_tech
+cmd_whois_lookup  = cmd_whois
+cmd_headers_check = cmd_headers
+cmd_subdomain_enum = cmd_subdomains
+
 def main():
     # ── Single-instance lock (prevents Conflict on Railway redeploy) ──────
     import fcntl
@@ -19290,7 +19330,7 @@ def main():
     )
 
     # ── v51: Start async cache GC background loop ──
-    asyncio.get_event_loop().create_task(_async_cache_gc_loop())
+    asyncio.ensure_future(_async_cache_gc_loop())
     logger.info("v51: Async cache GC loop started")  # async GC loop started
     # ── Init asyncio primitives (event loop must be running) ─
     global download_semaphore, scan_semaphore, _active_scans, db_lock, _dl_queue
@@ -20121,6 +20161,7 @@ async def cmd_cloudcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     _active_scans.set(uid, "CloudCheck")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "CloudCheck", url if context.args else "")))
 
     msg = await update.effective_message.reply_text(
         f"☁️ *Cloud/CDN Bypass — `{raw}`*\n\n"
@@ -21299,6 +21340,7 @@ async def cmd_sourcemap(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     _active_scans.set(uid, "SourceMap")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "Sourcemap", url if context.args else "")))
 
     domain = urlparse(url).hostname
     msg = await update.effective_message.reply_text(
@@ -21573,6 +21615,7 @@ async def cmd_gitexposed(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     _active_scans.set(uid, "GitExposed")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "GitExposed", url if context.args else "")))
 
     domain = urlparse(url).hostname
     msg = await update.effective_message.reply_text(
@@ -22012,6 +22055,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ *`{_active_scans.get(uid)}` running* — `/stop` နှိပ်ပါ", parse_mode='Markdown')
         return
     _active_scans.set(uid, "Admin Finder")
+    asyncio.ensure_future(db_update(lambda db: track_scan(db, uid, "AdminFinder", url if context.args else "")))
 
     domain = urlparse(url).hostname
     base_url = f"{urlparse(url).scheme}://{domain}"
@@ -23827,10 +23871,6 @@ RESULTS:
     finally:
         _active_scans.pop(uid, None)
 
-if __name__ == '__main__': main()
-# at the bottom of bot_merged_v42.py
-# ══════════════════════════════════════════════════════════════════
-
 
 # ══════════════════════════════════════════════════
 # 🛡️  v43 ENHANCED 403 BYPASS ENGINE
@@ -23966,7 +24006,7 @@ _TECH_FINGERPRINTS = {
 }
 
 # /tech_stack → alias to /tech (merged)
-cmd_tech_stack = cmd_tech
+
 
 async def cmd_api_fuzzer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/api_fuzzer <url> — Advanced API Endpoint Discovery with 403 Bypass"""
@@ -24452,7 +24492,7 @@ async def cmd_site_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════
 
 # /whois_lookup → alias to /whois (merged)
-cmd_whois_lookup = cmd_whois
+
 
 async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -24803,7 +24843,7 @@ _SECURITY_HEADERS = {
 }
 
 # /headers_check → alias to /headers (merged)
-cmd_headers_check = cmd_headers
+
 
 async def cmd_waf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -24814,12 +24854,19 @@ async def cmd_waf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     if not context.args:
         await update.effective_message.reply_text(
-            "📌 *Usage:* `/waf https://example.com`\n\n"
-            "🛡️ WAF fingerprint + Cloudflare origin IP bypass", parse_mode='Markdown')
+            "\U0001f4cc *Usage:* `/waf https://example.com`\n\n"
+            "\U0001f6e1\ufe0f *WAF Detection + Cloudflare Origin IP*\n\n"
+            "Combines `/waf_detect` + `/cloudcheck` in one command:\n"
+            "  \u2022 WAF fingerprint (Cloudflare, AWS, Akamai, etc.)\n"
+            "  \u2022 Real origin IP leak via SecurityTrails/crt.sh\n"
+            "  \u2022 Bypass technique suggestions", parse_mode='Markdown')
         return
-    # Run both in parallel via the existing commands
-    await cmd_waf_detect(update, context)
-
+    # Run both in parallel
+    await asyncio.gather(
+        cmd_waf_detect(update, context),
+        cmd_cloudcheck(update, context),
+        return_exceptions=True
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -25217,7 +25264,7 @@ _SUBDOMAIN_WORDLIST = [
 ]
 
 # /subdomain_enum → alias to /subdomains (merged)
-cmd_subdomain_enum = cmd_subdomains
+
 
 async def cmd_cms_detect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/cms_detect <url> — Detect CMS type and version"""
@@ -25518,6 +25565,7 @@ async def cmd_smuggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     f"✅ *Not Vulnerable:* `{r.status}` — h2c upgrade rejected.",
                                     parse_mode='Markdown')
                             result_set = True
+                            _active_scans.pop(uid, None)
                             return
                 except (asyncio.TimeoutError, aiohttp.ClientError):
                     if proxy_entry: await _PROXY_MANAGER.mark_fail(proxy_entry)
@@ -25652,6 +25700,7 @@ async def cmd_h2c_smuggling(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await msg.edit_text(f"🟠 *POTENTIAL:* h2c in Upgrade header, status `{r.status}`.", parse_mode='Markdown')
                         else:
                             await msg.edit_text(f"✅ *Not Vulnerable:* `{r.status}` — h2c upgrade ignored.", parse_mode='Markdown')
+                        _active_scans.pop(uid, None)
                         return
             except Exception:
                 if proxy_entry: await _PROXY_MANAGER.mark_fail(proxy_entry)
