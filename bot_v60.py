@@ -47,7 +47,7 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError, Conflict
 from telegram.request import HTTPXRequest
-from __future__ import annotations
+from future import annotations
 
 # ── Memory monitoring (optional: pip install psutil) ─────────
 try:
