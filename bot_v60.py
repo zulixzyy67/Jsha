@@ -22574,6 +22574,127 @@ async def cmd_ratelimitbypass(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _active_scans.pop(uid, None)
 
 
+def _register_v60_handlers(app):
+    """Register all command handlers (v60 new + previously unregistered)."""
+
+    # ── v60 New Commands ─────────────────────────────────────────────────────
+    app.add_handler(CommandHandler("cloudcheck",   cmd_cloudcheck))
+    app.add_handler(CommandHandler("paramfuzz",    cmd_paramfuzz))
+    app.add_handler(CommandHandler("autopwn",      cmd_autopwn))
+    app.add_handler(CommandHandler("bruteforce",   cmd_bruteforce))
+    app.add_handler(CommandHandler("sourcemap",    cmd_sourcemap))
+    app.add_handler(CommandHandler("gitexposed",   cmd_gitexposed))
+    app.add_handler(CommandHandler("secretscan",   cmd_secretscan))
+    app.add_handler(CommandHandler("api",          cmd_api))
+    app.add_handler(CommandHandler("proxy",        cmd_proxy))
+    app.add_handler(CommandHandler("proxydl",      cmd_proxy_download))
+    app.add_handler(CommandHandler("proxystatus",  cmd_proxy_status))
+    app.add_handler(CommandHandler("proxyrefresh", cmd_proxy_refresh))
+    app.add_handler(CommandHandler("proxyadd",     cmd_proxy_add))
+    app.add_handler(CommandHandler("botstats",     cmd_botstats))
+    app.add_handler(CommandHandler("reportexport", cmd_report_export))
+    app.add_handler(CommandHandler("apifuzzer",    cmd_api_fuzzer))
+    app.add_handler(CommandHandler("passleak",     cmd_password_leak_check))
+    app.add_handler(CommandHandler("sitemap",      cmd_site_map))
+    app.add_handler(CommandHandler("info",         cmd_info_unified))
+    app.add_handler(CommandHandler("dnsenum",      cmd_dns_enum))
+    app.add_handler(CommandHandler("portscan",     cmd_port_scan))
+    app.add_handler(CommandHandler("sslcheck",     cmd_ssl_check))
+    app.add_handler(CommandHandler("waf",          cmd_waf))
+    app.add_handler(CommandHandler("wafdetect",    cmd_waf_detect))
+    app.add_handler(CommandHandler("corscheck",    cmd_cors_check))
+    app.add_handler(CommandHandler("dirbrute",     cmd_dir_brute))
+    app.add_handler(CommandHandler("cms",          cmd_cms_detect))
+    app.add_handler(CommandHandler("speed",        cmd_speed_audit))
+    app.add_handler(CommandHandler("smuggle",      cmd_smuggle))
+    app.add_handler(CommandHandler("h2smuggle",    cmd_h2c_smuggling))
+    app.add_handler(CommandHandler("oauthcheck",   cmd_oauth_steal))
+    app.add_handler(CommandHandler("idor",         cmd_idor_uuid_leak))
+    app.add_handler(CommandHandler("massassign",   cmd_api_mass_assign))
+    app.add_handler(CommandHandler("graphql",      cmd_graphql_batch))
+    app.add_handler(CommandHandler("ssltls",       cmd_ssltls_deep))
+    app.add_handler(CommandHandler("xxe",          cmd_xxe))
+    app.add_handler(CommandHandler("corsdeep",     cmd_cors_deep))
+    app.add_handler(CommandHandler("ratelimit",    cmd_ratelimit_test))
+    app.add_handler(CommandHandler("nuclei",       cmd_nuclei_lite))
+    app.add_handler(CommandHandler("shodan",       cmd_shodan_lite))
+    app.add_handler(CommandHandler("scanhistory",  cmd_scan_history))
+    app.add_handler(CommandHandler("jsrestore",    cmd_js_restore))
+    app.add_handler(CommandHandler("mystats2",     cmd_mystats_v2))
+
+    # ── Previously Unregistered Commands (pre-v60) ───────────────────────────
+
+    # Recon / Info gathering
+    app.add_handler(CommandHandler("vuln",         cmd_vuln))
+    app.add_handler(CommandHandler("headers",      cmd_headers))
+    app.add_handler(CommandHandler("links",        cmd_links))
+    app.add_handler(CommandHandler("robots",       cmd_robots))
+    app.add_handler(CommandHandler("whois",        cmd_whois))
+    app.add_handler(CommandHandler("cookies",      cmd_cookies))
+    app.add_handler(CommandHandler("screenshot",   cmd_screenshot))
+    app.add_handler(CommandHandler("subdomains",   cmd_subdomains))
+    app.add_handler(CommandHandler("tech2",        cmd_tech))           # cmd_tech_detect already on /tech
+    app.add_handler(CommandHandler("discover",     cmd_discover))
+    app.add_handler(CommandHandler("monitor",      cmd_monitor))
+    app.add_handler(CommandHandler("extract",      cmd_extract))
+    app.add_handler(CommandHandler("appassets",    cmd_appassets))
+    app.add_handler(CommandHandler("sensitive",    cmd_sensitive))
+    app.add_handler(CommandHandler("bola",         cmd_bola))
+
+    # Scan / Attack
+    app.add_handler(CommandHandler("scan2",        cmd_scan))           # cmd_scan_unified already on /scan
+    app.add_handler(CommandHandler("scan1",        cmd_scan_single))
+    app.add_handler(CommandHandler("recon2",       cmd_recon))          # cmd_recon_unified already on /recon
+    app.add_handler(CommandHandler("bypass403",    cmd_bypass403))
+    app.add_handler(CommandHandler("jwtattack",    cmd_jwtattack))
+    app.add_handler(CommandHandler("smartfuzz",    cmd_smartfuzz))
+    app.add_handler(CommandHandler("fuzz2",        cmd_fuzz))           # cmd_fuzz_dispatch already on /fuzz
+    app.add_handler(CommandHandler("pentest",      cmd_pentest))
+    app.add_handler(CommandHandler("sqlitest",     cmd_sqlitest))
+    app.add_handler(CommandHandler("xsstest",      cmd_xsstest))
+    app.add_handler(CommandHandler("ssrftest",     cmd_ssrftest))
+    app.add_handler(CommandHandler("lfitest",      cmd_lfitest))
+    app.add_handler(CommandHandler("authtest",     cmd_authtest))
+    app.add_handler(CommandHandler("analyze",      cmd_analyze))
+    app.add_handler(CommandHandler("apitest",      cmd_apitest))
+    app.add_handler(CommandHandler("apidiscover",  cmd_api_discover))
+
+    # Audit / Report
+    app.add_handler(CommandHandler("audit2",       cmd_audit))          # cmd_audit_unified already on /audit
+    app.add_handler(CommandHandler("devaudit",     cmd_devaudit))
+    app.add_handler(CommandHandler("codeaudit",    cmd_codeaudit))
+    app.add_handler(CommandHandler("secreport",    cmd_secreport))
+    app.add_handler(CommandHandler("hardening",    cmd_hardening))
+    app.add_handler(CommandHandler("fixguide",     cmd_fixguide))
+    app.add_handler(CommandHandler("fixall",       cmd_fixall))
+    app.add_handler(CommandHandler("fixunified",   cmd_fix))            # cmd_fix_ai already on /fix
+    app.add_handler(CommandHandler("ssl",          cmd_ssl))
+    app.add_handler(CommandHandler("cors",         cmd_cors))
+
+    # Admin / Utility
+    app.add_handler(CommandHandler("admin2",       cmd_admin))          # cmd_admin_unified already on /admin
+    app.add_handler(CommandHandler("adminset",     cmd_adminset))
+    app.add_handler(CommandHandler("ban",          cmd_ban))
+    app.add_handler(CommandHandler("unban",        cmd_unban))
+    app.add_handler(CommandHandler("setlimit",     cmd_setlimit))
+    app.add_handler(CommandHandler("setpages",     cmd_setpages))
+    app.add_handler(CommandHandler("setassets",    cmd_setassets))
+    app.add_handler(CommandHandler("setforcejoin", cmd_setforcejoin))
+    app.add_handler(CommandHandler("userinfo",     cmd_userinfo))
+    app.add_handler(CommandHandler("broadcast",    cmd_broadcast))
+    app.add_handler(CommandHandler("allusers",     cmd_allusers))
+    app.add_handler(CommandHandler("resetquota",   cmd_resetquota))
+    app.add_handler(CommandHandler("mystats",      cmd_mystats))
+    app.add_handler(CommandHandler("history",      cmd_history))
+    app.add_handler(CommandHandler("sys",          cmd_sys))
+    app.add_handler(CommandHandler("disk",         cmd_disk))
+    app.add_handler(CommandHandler("logs",         cmd_logs))
+    app.add_handler(CommandHandler("clean",        cmd_clean))
+    app.add_handler(CommandHandler("cleandl",      cmd_cleandl))
+    app.add_handler(CommandHandler("gofileinfo",   cmd_gofileinfo))
+    app.add_handler(CommandHandler("report2",      cmd_report))
+
+
 def main():
     # ── Single-instance lock (prevents Conflict on Railway redeploy) ───
     import fcntl
