@@ -22645,7 +22645,7 @@ def main():
     app.add_handler(CH("takeover",       cmd_subdomain_takeover)) # v58 subdomain takeover
     app.add_handler(CH("ratelimitbypass",cmd_ratelimitbypass)) # v58 rl bypass
     # ── v58 new scan commands ──────────────────────────────────────────────
-    _register_v58_handlers(app)
+    _register_v60_handlers(app)
     app.add_handler(CallbackQueryHandler(vip_callback, pattern="^vip_"))
     app.add_handler(CallbackQueryHandler(hub_callback, pattern="^hub:"))
 
