@@ -16,7 +16,7 @@
 # ║  📝 Structured JSON logging for Railway dashboard           ║
 # ║  🎯 Better error messages (quota, timeout, system busy)     ║
 # ╚══════════════════════════════════════════════════════════════╝
-
+from __future__ import annotations  
 import os, re, json, time, shutil, zipfile, hashlib, hmac, string, struct, tempfile, threading
 import logging, asyncio, subprocess, socket, random, difflib, functools, io
 try:
@@ -47,7 +47,6 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError, Conflict
 from telegram.request import HTTPXRequest
-from future import annotations
 
 # ── Memory monitoring (optional: pip install psutil) ─────────
 try:
