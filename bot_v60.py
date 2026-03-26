@@ -47,6 +47,7 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError, Conflict
 from telegram.request import HTTPXRequest
+from __future__ import annotations
 
 # ── Memory monitoring (optional: pip install psutil) ─────────
 try:
@@ -21397,7 +21398,6 @@ cmd_subdomain_enum = cmd_subdomains
 #     ⑤ JSON Output     — CI/CD exit-code 0/1, machine-parseable
 # ══════════════════════════════════════════════════════════════════════════════
 
-from __future__ import annotations
 import io as _io_sec
 
 class _Severity(int):
